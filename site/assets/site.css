@@ -598,3 +598,5 @@ legend { font: 400 1.4rem/1.2 var(--font-display); color: var(--petrol-900); mar
 .form > .btn, .enquiry-form > .btn { justify-self: start; }
 .prose .enquiry-form p { color: var(--ink-mute); }
 .article > *, .chalet-layout > * { min-width: 0; }
+.map-embed { position: relative; aspect-ratio: 4 / 3; border-radius: var(--radius); overflow: hidden; border: 1px solid var(--stone-200); background: var(--stone-100); margin: 1em 0 2em; }
+.map-embed iframe { position: absolute; inset: 0; width: 100%; height: 100%; border: 0; }
