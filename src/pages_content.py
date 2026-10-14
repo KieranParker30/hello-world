@@ -96,7 +96,18 @@ def directive(name, arg):
             cs.sort(key=lambda c: c["from_price"] or 99999)
             return f'<div class="grid grid-2 content-cards">{"".join(chalet_card(c, "(max-width: 720px) 100vw, 33vw") for c in cs[:6])}</div>'
     if name == "reviews":
-        return reviews_block(3, head=False).replace('class="reviews"', 'class="reviews reviews--content"')
+        n = len(REVIEWS) if arg == "all" else 3
+        cls = "reviews reviews--grid" if arg == "all" else "reviews reviews--content"
+        return reviews_block(n, head=False).replace('class="reviews"', f'class="{cls}"')
+    if name == "posts":
+        cards = []
+        for p, title, cat, blurb, image in POSTS:
+            link = href(p) if not p.startswith("http") else p
+            cards.append(f'<article class="card"><div class="card-media">{img(image, title, sizes="(max-width: 720px) 100vw, 33vw", w=800)}</div>'
+                         f'<div class="card-body"><div class="card-meta"><span>{esc(cat)}</span></div><h3><a href="{link}">{esc(title)}</a></h3><p>{esc(blurb)}</p>'
+                         f'<div class="card-foot"><span class="link-arrow">Read</span></div></div></article>')
+        return f'<div class="grid grid-3">{"".join(cards)}</div>'
+
     if name == "form":
         return FORMS[arg]()
     if name == "resorts":
@@ -286,6 +297,22 @@ def form_contact():
 
 
 FORMS = {"enquiry": form_enquiry, "contact": form_contact}
+
+LIVE = "https://www.leski.com/blog/"
+POSTS = [
+    (LIVE + "le_ski_latest/Belated_Yorkshire_Day", "Happy belated Yorkshire Day!", "Le Ski latest",
+     "Apologies to all Yorkshire folk — at 60% full already for this winter, we've been a bit busy.", "Roving_reporter.jpg"),
+    (LIVE + "holiday_advice/things-to-do-in-courchevel", "Things to do in Courchevel: a complete guide", "Holiday advice",
+     "600km of pistes in Les 3 Vallées — and plenty more to do off them.", "IMG_1413.jpg"),
+    (LIVE + "holiday_advice/lessons-val-slopes", "Ski lessons in Val d'Isère: from booking to the slopes", "Holiday advice",
+     "Your step-by-step guide, from booking a lesson to clicking into your skis.", "Cours_de_ski-7096-1200px.jpg"),
+    (LIVE + "holiday_advice/private-group-ski-lessons", "Private vs group lessons in Val d'Isère", "Holiday advice",
+     "Which should you choose? We weigh up the pros and cons.", "AL_NEW_GEN_7324002-min.jpg"),
+    (LIVE + "holiday_advice/childrens-lessons-la-tania", "Children's lessons in La Tania: are they worth it?", "Holiday advice",
+     "The value of children's ski lessons in La Tania.", "LAT-bubble-B_1.jpg"),
+    ("blog/holiday_advice/Courchevel_Aquamotion_guide", "Our guide to Aquamotion, Courchevel", "Holiday advice",
+     "Pools, slides, a surf wave, a salt cave and spa — everything you need to know.", "AL_25111150-Aquamotion-Surf_Board_paysage_resized_1.jpg"),
+]
 
 
 # ---------------------------------------------------------------------------
