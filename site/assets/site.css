@@ -565,3 +565,36 @@ p { margin: 0 0 1.1em; }
   .filters-row { grid-template-columns: 1fr; }
   .filters-toggles .btn { margin-left: 0; }
 }
+
+/* ==========================================================================
+   Content pages
+   ========================================================================== */
+.article--no-toc { grid-template-columns: minmax(0, 1fr) 300px; }
+.prose--wide { max-width: none; }
+.prose .content-cards { margin: 1.6em 0; }
+.prose .content-cards p { color: var(--ink-soft); }
+.prose .card h3 { margin: 0; }
+.prose .tile h3 { margin: 0 0 6px; color: #fff; }
+.prose .tile p { color: rgba(255,255,255,.85); margin: 0; }
+.tile--short { aspect-ratio: 16 / 10; }
+.prose blockquote cite { display: block; margin-top: 10px; font: 500 14px/1.4 var(--font-body); font-style: normal; color: var(--ink-mute); }
+.prose blockquote p { margin: 0; color: var(--petrol-900); }
+.prose .accordion { margin: 1.2em 0 1.6em; }
+.prose .accordion p { color: var(--ink-soft); }
+.table-wrap { overflow-x: auto; margin: 1.4em 0; border: 1px solid var(--stone-200); border-radius: var(--radius); background: var(--paper); }
+.table-wrap table { margin: 0; }
+.table-wrap tr:last-child td { border-bottom: 0; }
+.prose .callout, .callout { background: var(--mint-100); border-radius: var(--radius); padding: 20px 24px; margin: 1.6em 0; }
+.callout p:last-child { margin: 0; }
+.reviews--content { grid-template-columns: 1fr; margin: 1.4em 0; }
+.prose h2 { scroll-margin-top: calc(var(--header-h) + 24px); }
+fieldset { border: 0; padding: 0; margin: 0 0 8px; display: grid; gap: 18px; }
+legend { font: 400 1.4rem/1.2 var(--font-display); color: var(--petrol-900); margin-bottom: 18px; padding: 0; }
+.enquiry-form { background: var(--paper); border: 1px solid var(--stone-200); border-radius: var(--radius-lg); padding: clamp(20px, 3vw, 36px); }
+.form-success h3 { margin-top: 0; }
+@media (max-width: 980px) { .article--no-toc { grid-template-columns: 1fr; } }
+.field { min-width: 0; }
+.field input, .field select, .field textarea { width: 100%; min-width: 0; }
+.form > .btn, .enquiry-form > .btn { justify-self: start; }
+.prose .enquiry-form p { color: var(--ink-mute); }
+.article > *, .chalet-layout > * { min-width: 0; }
