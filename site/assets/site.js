@@ -65,3 +65,32 @@
     });
   });
 })();
+
+// Chalet photo lightbox
+(function () {
+  var lb = document.querySelector('.lightbox');
+  if (!lb) return;
+  var slides = lb.querySelectorAll('[data-slide]'), count = lb.querySelector('.lb-count'), i = 0, last;
+  function show(n) {
+    i = (n + slides.length) % slides.length;
+    slides.forEach(function (s, k) {
+      s.classList.toggle('is-active', k === i);
+      if (Math.abs(k - i) <= 1 || k === (i + 1) % slides.length) { var im = s.querySelector('img'); if (im.dataset.src) { im.src = im.dataset.src; im.removeAttribute('data-src'); } }
+    });
+    count.textContent = (i + 1) + ' / ' + slides.length;
+  }
+  function open(n) { last = document.activeElement; lb.hidden = false; document.body.style.overflow = 'hidden'; show(n); lb.querySelector('.lb-close').focus(); }
+  function close() { lb.hidden = true; document.body.style.overflow = ''; if (last) last.focus(); }
+  document.querySelectorAll('[data-lightbox-open]').forEach(function (b) { b.addEventListener('click', function () { open(+b.dataset.lightboxOpen); }); });
+  lb.querySelector('[data-lightbox-close]').addEventListener('click', close);
+  lb.querySelector('[data-lightbox-prev]').addEventListener('click', function () { show(i - 1); });
+  lb.querySelector('[data-lightbox-next]').addEventListener('click', function () { show(i + 1); });
+  lb.addEventListener('click', function (e) { if (e.target === lb || e.target.classList.contains('lb-stage')) close(); });
+  document.addEventListener('keydown', function (e) {
+    if (lb.hidden) return;
+    if (e.key === 'Escape') close(); if (e.key === 'ArrowLeft') show(i - 1); if (e.key === 'ArrowRight') show(i + 1);
+  });
+  var x0 = null;
+  lb.addEventListener('touchstart', function (e) { x0 = e.touches[0].clientX; }, { passive: true });
+  lb.addEventListener('touchend', function (e) { if (x0 === null) return; var dx = e.changedTouches[0].clientX - x0; if (Math.abs(dx) > 40) show(i + (dx < 0 ? 1 : -1)); x0 = null; });
+})();

@@ -434,7 +434,8 @@ def search_panel(resort=""):
     dates = ["29 Nov 2026", "6 Dec 2026", "13 Dec 2026", "20 Dec 2026", "27 Dec 2026", "3 Jan 2027", "10 Jan 2027", "17 Jan 2027",
              "24 Jan 2027", "31 Jan 2027", "7 Feb 2027", "14 Feb 2027", "21 Feb 2027", "28 Feb 2027", "7 Mar 2027", "14 Mar 2027",
              "21 Mar 2027", "28 Mar 2027", "4 Apr 2027", "11 Apr 2027"]
-    opts_d = "".join(f'<option value="{d}">Sun {d}</option>' for d in dates)
+    import datetime as _dt
+    opts_d = "".join(f'<option value="{_dt.datetime.strptime(d, "%d %b %Y").date().isoformat()}">Sun {d}</option>' for d in dates)
     opts_g = "".join(f'<option value="{g}">{g} guests</option>' for g in ["2-6", "7-10", "11-14", "15-18", "19-25"])
     opts_r = "".join(f'<option value="{k}"{" selected" if k == resort else ""}>{esc(r["name"])}</option>' for k, r in RESORTS.items())
     return f'''
