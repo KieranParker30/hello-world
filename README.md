@@ -32,6 +32,7 @@ The model is built the way professional scanning tools build theirs:
 
 - **Texture map.** Colour comes from your full-resolution photos. Each texel uses the photos that see that spot best (facing it, close up, not blocked by anything else) and blends gently between neighbouring photos, so you don't see seams.
 - **Normal map.** Fine surface detail (bark, grain, scratches) is baked from the high-resolution scan, so a lighter mesh still catches the light like the detailed one.
+- **Clean surface.** Small gaps are bridged with screened Poisson surface reconstruction, frayed borders are trimmed and pinholes are filled. Large areas no camera saw stay open rather than invented. Use `--keep-gaps` to skip the Poisson step.
 - **Web-sized mesh.** The detailed surface is reduced to a sensible triangle budget with quadric decimation and UV-unwrapped with [xatlas](https://github.com/jpcy/xatlas).
 - **Draco compression.** Geometry is compressed with Draco, which `<model-viewer>`, three.js and Babylon.js all support. Use `--no-draco` for tools that don't.
 - **glTF conventions.** Metres, Y up, centred, with the photographed side facing the default camera.
@@ -97,11 +98,12 @@ For even smaller downloads, you can re-compress the textures to KTX2 or WebP wit
 | `--size` | 100 | Largest dimension in mm. Photos have no real-world scale, so set this to the real object size if it matters. |
 | `--remove-ground` | off | Cut away the table or floor the object stands on |
 | `--crop` | 0.75 | How much of the surroundings to keep around the object (raise it if parts get cut off) |
+| `--keep-gaps` | off | Don't bridge small gaps (keeps only directly measured surface) |
 | `--html` | off | Also write a `<model-viewer>` web page for the model |
 | `--no-draco` | off | Store the geometry uncompressed |
 | `--work-dir` | temp | Keep the intermediate files (the COLMAP project can be opened in the COLMAP GUI) |
 
-It runs on a normal CPU, no graphics card needed. Parts no camera saw are left open, not guessed, so the underside of an object on a table is usually open.
+It runs on a normal CPU, no graphics card needed. The underside of an object on a table is never photographed, so it stays open.
 
 ## One image → relief
 

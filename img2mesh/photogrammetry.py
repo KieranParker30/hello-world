@@ -9,7 +9,8 @@ Pipeline:
 3. Fusion: integrate all depth maps into a truncated signed distance field
    (TSDF) voxel grid, averaging out noise.
 4. Meshing: extract the detailed surface with surface nets, keeping only parts
-   that cameras actually observed.
+   that cameras actually observed, then (by default) re-fit it with screened
+   Poisson reconstruction to bridge small gaps, and tidy borders and pinholes.
 5. Texturing (texture.py): decimate, UV-unwrap, bake a colour texture from the
    full-resolution photos and a normal map from the detailed surface.
 
@@ -26,6 +27,7 @@ from pathlib import Path
 import numpy as np
 from PIL import Image, ImageOps
 
+from .cleanup import clean_scan
 from .mesh import Mesh
 from .surface import surface_nets
 
@@ -442,6 +444,54 @@ def _largest_component(mesh: Mesh, keep_fraction: float = 0.02) -> Mesh:
     return Mesh(mesh.vertices[used], remap[faces], colours)
 
 
+def poisson_surface(mesh: Mesh, work: Path, resolution: int, trim: float = 7.5) -> Mesh:
+    """Screened Poisson reconstruction (COLMAP's CPU implementation) through the
+    scan's oriented points: bridges gaps and holes with a smooth surface, then
+    trims areas without enough supporting data."""
+    _, pycolmap = _require()
+    normals = mesh.vertex_normals()
+    header = (f"ply\nformat binary_little_endian 1.0\nelement vertex {len(mesh.vertices)}\n"
+              "property float x\nproperty float y\nproperty float z\n"
+              "property float nx\nproperty float ny\nproperty float nz\nend_header\n")
+    src, dst = work / "poisson_in.ply", work / "poisson_out.ply"
+    src.write_bytes(header.encode() + np.hstack([mesh.vertices, normals]).astype("<f4").tobytes())
+    options = pycolmap.PoissonMeshingOptions()
+    options.depth = int(np.ceil(np.log2(resolution))) + 1  # octree cells about one voxel
+    options.trim = trim
+    options.color = False
+    pycolmap.poisson_meshing(src, dst, options)
+    out = _read_ply_mesh(dst)
+    if len(out.faces) == 0:
+        return mesh
+    # Keep the winding consistent with the input normals (outward, towards cameras).
+    from scipy.spatial import cKDTree
+
+    sample = out.vertices[:: max(1, len(out.vertices) // 20000)]
+    _, nearest = cKDTree(mesh.vertices).query(sample)
+    out_n = Mesh(out.vertices, out.faces).vertex_normals()[:: max(1, len(out.vertices) // 20000)]
+    if np.einsum("ij,ij->i", out_n, normals[nearest]).mean() < 0:
+        out = Mesh(out.vertices, out.faces[:, ::-1])
+    return out
+
+
+def _read_ply_mesh(path: Path) -> Mesh:
+    """Read a binary little-endian PLY with float vertex properties and triangles."""
+    data = path.read_bytes()
+    end = data.index(b"end_header\n") + len(b"end_header\n")
+    header = data[:end].decode("ascii")
+    nv = int(header.split("element vertex ")[1].split()[0])
+    nf = int(header.split("element face ")[1].split()[0])
+    vblock = header.split("element vertex")[1].split("element face")[0]
+    nprops = sum(line.startswith("property") for line in vblock.splitlines())
+    verts = np.frombuffer(data, "<f4", nv * nprops, end).reshape(nv, nprops)[:, :3]
+    count_type = "u1" if "list uchar" in header else "<i4"
+    rec = np.dtype([("n", count_type), ("i", "<i4", 3)])
+    faces = np.frombuffer(data, rec, nf, end + nv * nprops * 4)
+    if nf and not (faces["n"] == 3).all():
+        raise ValueError("Poisson output has non-triangle faces")
+    return Mesh(verts.astype(np.float64), faces["i"].astype(np.int64))
+
+
 def _up_rotation(views: list[View]) -> np.ndarray:
     """Rotation taking the photographer's average 'up' direction to +Z."""
     up = -np.mean([v.R[1] for v in views], axis=0)  # camera +y points down in images
@@ -485,6 +535,7 @@ def reconstruct(
     crop: float = 0.75,
     smooth: float = 0.7,
     remove_ground: bool = False,
+    fill_gaps: bool = True,
     work_dir: str | None = None,
     log=print,
 ) -> Mesh:
@@ -546,6 +597,9 @@ def reconstruct(
         if len(dense.faces) == 0:
             raise ValueError("No surface found; try more photos or a lower quality setting")
         dense = _largest_component(Mesh(lo + (dense.vertices + 0.5) * voxel, dense.faces))
+        if fill_gaps:
+            dense = poisson_surface(dense, work, preset["resolution"])
+        dense = clean_scan(dense)
         log(f"      Detailed surface: {len(dense.faces):,} triangles")
 
         log(f"[5/5] Texturing ({preset['faces']:,} triangles, "

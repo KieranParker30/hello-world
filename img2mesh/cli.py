@@ -62,6 +62,8 @@ def build_parser() -> argparse.ArgumentParser:
                    help="how much surroundings to keep (bigger = more, default 0.75)")
     p.add_argument("--remove-ground", action="store_true",
                    help="cut away the table or floor the object stands on")
+    p.add_argument("--keep-gaps", action="store_true",
+                   help="don't bridge small gaps with Poisson surface reconstruction")
     p.add_argument("--no-draco", action="store_true",
                    help="don't Draco-compress the .glb geometry (for viewers without Draco)")
     p.add_argument("--html", action="store_true",
@@ -117,7 +119,8 @@ def main(argv: list[str] | None = None) -> int:
                 args.images, quality=args.quality, size=args.size, resolution=args.resolution,
                 faces=args.faces, texture_size=args.texture_size,
                 max_image_size=args.image_size, dense_size=args.dense_size, crop=args.crop,
-                remove_ground=args.remove_ground, work_dir=args.work_dir)
+                remove_ground=args.remove_ground, fill_gaps=not args.keep_gaps,
+                work_dir=args.work_dir)
         else:
             angles = [float(a) for a in args.angles.split(",")] if args.angles else None
             mesh = images_to_model(args.images, angles, args.resolution, args.size,
