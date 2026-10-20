@@ -103,7 +103,7 @@ For even smaller downloads, you can re-compress the textures to KTX2 or WebP wit
 | `--no-draco` | off | Store the geometry uncompressed |
 | `--work-dir` | temp | Keep the intermediate files (the COLMAP project can be opened in the COLMAP GUI) |
 
-It runs on a normal CPU, no graphics card needed. The underside of an object on a table is never photographed, so it stays open.
+It runs on a normal CPU, no graphics card needed. On a 4-core machine, 41 phone photos take about 11 minutes at `high` and produce a 9.6 MB `.glb`; `draft` takes about 4 minutes. The underside of an object on a table is never photographed, so it stays open.
 
 ## One image → relief
 
