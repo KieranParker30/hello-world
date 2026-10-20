@@ -141,12 +141,13 @@ def _write_glb(mesh: Mesh, path: Path) -> None:
          "min": pos.min(0).tolist(), "max": pos.max(0).tolist()},
         {"bufferView": 1, "componentType": 5126, "count": len(pos), "type": "VEC3"},
     ]
-    if mesh.colors is not None:
-        rgba = np.hstack([mesh.colors, np.full((len(pos), 1), 255, np.uint8)])
-        chunks.append(rgba.tobytes())
+    if mesh.colors is not None:  # glTF vertex colours are linear, not sRGB
+        srgb = mesh.colors / 255.0
+        linear = np.where(srgb <= 0.04045, srgb / 12.92, ((srgb + 0.055) / 1.055) ** 2.4)
+        chunks.append(linear.astype("<f4").tobytes())
         attributes["COLOR_0"] = 2
-        accessors.append({"bufferView": 2, "componentType": 5121, "normalized": True,
-                          "count": len(pos), "type": "VEC4"})
+        accessors.append({"bufferView": 2, "componentType": 5126, "count": len(pos),
+                          "type": "VEC3"})
     chunks.append(mesh.faces.astype("<u4").tobytes())
     accessors.append({"bufferView": len(chunks) - 1, "componentType": 5125,
                       "count": mesh.faces.size, "type": "SCALAR"})
