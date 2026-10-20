@@ -1,7 +1,9 @@
-"""Triangle mesh container and file writers (STL, OBJ, PLY)."""
+"""Triangle mesh container and file writers (STL, OBJ, PLY, GLB)."""
 
 from __future__ import annotations
 
+import io
+import json
 import struct
 from dataclasses import dataclass
 from pathlib import Path
@@ -11,15 +13,27 @@ import numpy as np
 
 @dataclass
 class Mesh:
-    vertices: np.ndarray  # (N, 3) float
+    vertices: np.ndarray  # (N, 3) float, millimetres, +Z up
     faces: np.ndarray  # (M, 3) int, counter-clockwise when viewed from outside
     colors: np.ndarray | None = None  # optional (N, 3) uint8 per-vertex RGB
+    uvs: np.ndarray | None = None  # optional (N, 2) texture coords, v pointing down the image
+    normals: np.ndarray | None = None  # optional (N, 3) shading normals
+    texture: np.ndarray | None = None  # optional (H, W, 3) uint8 colour map
+    normal_map: np.ndarray | None = None  # optional (H, W, 3) uint8 tangent-space normals
 
     def __post_init__(self) -> None:
         self.vertices = np.asarray(self.vertices, dtype=np.float64).reshape(-1, 3)
         self.faces = np.asarray(self.faces, dtype=np.int64).reshape(-1, 3)
         if self.colors is not None:
             self.colors = np.asarray(self.colors, dtype=np.uint8).reshape(-1, 3)
+        if self.uvs is not None:
+            self.uvs = np.asarray(self.uvs, dtype=np.float64).reshape(-1, 2)
+        if self.normals is not None:
+            self.normals = np.asarray(self.normals, dtype=np.float64).reshape(-1, 3)
+
+    def _with(self, vertices: np.ndarray, normals: np.ndarray | None) -> "Mesh":
+        return Mesh(vertices, self.faces, self.colors, self.uvs, normals,
+                    self.texture, self.normal_map)
 
     def face_normals(self) -> np.ndarray:
         v = self.vertices[self.faces]
@@ -52,9 +66,15 @@ class Mesh:
         centre = (lo + hi) / 2
         v = (self.vertices - centre) * scale
         v[:, 2] -= v[:, 2].min()
-        return Mesh(v, self.faces, self.colors)
+        return self._with(v, self.normals)
+
+    def rotated(self, R: np.ndarray) -> "Mesh":
+        n = None if self.normals is None else self.normals @ R.T
+        return self._with(self.vertices @ R.T, n)
 
     def vertex_normals(self) -> np.ndarray:
+        if self.normals is not None:
+            return self.normals
         v = self.vertices[self.faces]
         face_n = np.cross(v[:, 1] - v[:, 0], v[:, 2] - v[:, 0])  # area-weighted
         n = np.zeros_like(self.vertices)
@@ -65,14 +85,35 @@ class Mesh:
         n[length[:, 0] == 0] = [0, 0, 1]  # only touches zero-area faces
         return n
 
-    def save(self, path: str | Path) -> None:
+    def vertex_colors(self) -> np.ndarray | None:
+        """Per-vertex colours, sampled from the texture if there is one."""
+        if self.colors is not None or self.texture is None or self.uvs is None:
+            return self.colors
+        h, w = self.texture.shape[:2]
+        x = np.clip(np.round(self.uvs[:, 0] * w - 0.5), 0, w - 1).astype(int)
+        y = np.clip(np.round(self.uvs[:, 1] * h - 0.5), 0, h - 1).astype(int)
+        return self.texture[y, x]
+
+    def save(self, path: str | Path, draco: bool = False, jpeg_quality: int = 90) -> None:
         path = Path(path)
         ext = path.suffix.lower()
-        writers = {".stl": _write_stl, ".obj": _write_obj, ".ply": _write_ply, ".glb": _write_glb}
-        if ext not in writers:
+        if ext not in (".stl", ".obj", ".ply", ".glb"):
             raise ValueError(f"Unsupported output format '{ext}' (use .stl, .obj, .ply or .glb)")
         path.parent.mkdir(parents=True, exist_ok=True)
-        writers[ext](self, path)
+        if ext == ".glb":
+            _write_glb(self, path, draco, jpeg_quality)
+        elif ext == ".obj":
+            _write_obj(self, path, jpeg_quality)
+        else:
+            {".stl": _write_stl, ".ply": _write_ply}[ext](self, path)
+
+
+def _encode_image(img: np.ndarray, quality: int) -> bytes:
+    from PIL import Image
+
+    buf = io.BytesIO()
+    Image.fromarray(img).save(buf, "JPEG", quality=quality, subsampling=0, optimize=True)
+    return buf.getvalue()
 
 
 def _write_stl(mesh: Mesh, path: Path) -> None:
@@ -86,24 +127,42 @@ def _write_stl(mesh: Mesh, path: Path) -> None:
         fh.write(data.tobytes())
 
 
-def _write_obj(mesh: Mesh, path: Path) -> None:
+def _write_obj(mesh: Mesh, path: Path, jpeg_quality: int = 90) -> None:
+    textured = mesh.texture is not None and mesh.uvs is not None
+    colors = None if textured else mesh.vertex_colors()
     with open(path, "w") as fh:
         fh.write("# img2mesh\n")
-        if mesh.colors is None:
+        if textured:
+            stem = path.stem
+            fh.write(f"mtllib {stem}.mtl\nusemtl scan\n")
+            mtl = f"newmtl scan\nKa 1 1 1\nKd 1 1 1\nKs 0 0 0\nmap_Kd {stem}_color.jpg\n"
+            (path.parent / f"{stem}_color.jpg").write_bytes(_encode_image(mesh.texture, jpeg_quality))
+            if mesh.normal_map is not None:
+                mtl += f"norm {stem}_normal.jpg\n"
+                (path.parent / f"{stem}_normal.jpg").write_bytes(
+                    _encode_image(mesh.normal_map, max(jpeg_quality, 95)))
+            (path.parent / f"{stem}.mtl").write_text(mtl)
+        if colors is None:
             np.savetxt(fh, mesh.vertices, fmt="v %.6f %.6f %.6f")
         else:  # widely supported "v x y z r g b" extension
-            np.savetxt(fh, np.hstack([mesh.vertices, mesh.colors / 255.0]),
+            np.savetxt(fh, np.hstack([mesh.vertices, colors / 255.0]),
                        fmt="v %.6f %.6f %.6f %.4f %.4f %.4f")
-        np.savetxt(fh, mesh.faces + 1, fmt="f %d %d %d")
+        if textured:
+            # OBJ's v axis points up the image.
+            np.savetxt(fh, np.c_[mesh.uvs[:, 0], 1 - mesh.uvs[:, 1]], fmt="vt %.6f %.6f")
+            np.savetxt(fh, np.repeat(mesh.faces + 1, 2, axis=1), fmt="f %d/%d %d/%d %d/%d")
+        else:
+            np.savetxt(fh, mesh.faces + 1, fmt="f %d %d %d")
 
 
 def _write_ply(mesh: Mesh, path: Path) -> None:
+    colors = mesh.vertex_colors()
     header = (
         "ply\nformat binary_little_endian 1.0\n"
         f"element vertex {len(mesh.vertices)}\n"
         "property float x\nproperty float y\nproperty float z\n"
         + ("property uchar red\nproperty uchar green\nproperty uchar blue\n"
-           if mesh.colors is not None else "")
+           if colors is not None else "")
         + f"element face {len(mesh.faces)}\n"
         "property list uchar int vertex_indices\nend_header\n"
     )
@@ -113,65 +172,142 @@ def _write_ply(mesh: Mesh, path: Path) -> None:
     faces["idx"] = mesh.faces
     with open(path, "wb") as fh:
         fh.write(header.encode("ascii"))
-        if mesh.colors is None:
+        if colors is None:
             fh.write(mesh.vertices.astype("<f4").tobytes())
         else:
             rec = np.dtype([("xyz", "<f4", 3), ("rgb", "u1", 3)])
             verts = np.zeros(len(mesh.vertices), dtype=rec)
-            verts["xyz"], verts["rgb"] = mesh.vertices, mesh.colors
+            verts["xyz"], verts["rgb"] = mesh.vertices, colors
             fh.write(verts.tobytes())
         fh.write(faces.tobytes())
 
 
-def _write_glb(mesh: Mesh, path: Path) -> None:
-    """Binary glTF 2.0 (opens in Windows 3D Viewer, Blender, web viewers, phones).
+def _write_glb(mesh: Mesh, path: Path, draco: bool = False, jpeg_quality: int = 90) -> None:
+    """Binary glTF 2.0: the standard 3D format for the web (three.js, <model-viewer>,
+    Babylon.js), and it opens in Blender, Windows 3D Viewer and on phones.
 
-    glTF is Y-up, so our Z-up coordinates are rotated on export.
+    glTF is Y-up and in metres, so our Z-up millimetre coordinates are converted.
     """
-    import json
+    to_gltf = np.array([[1, 0, 0], [0, 0, 1], [0, -1, 0]], dtype=np.float64)  # Z-up -> Y-up
+    pos = (mesh.vertices @ to_gltf.T / 1000.0).astype("<f4")
+    nrm = (mesh.vertex_normals() @ to_gltf.T).astype("<f4")
+    textured = mesh.texture is not None and mesh.uvs is not None
+    vcol = None if textured else mesh.vertex_colors()
+    idx = mesh.faces.astype("<u4")
+    if draco and vcol is not None:
+        raise ValueError("Draco export supports textured or plain meshes, not vertex colours")
 
-    pos = mesh.vertices[:, [0, 2, 1]].astype("<f4")
-    pos[:, 2] *= -1
-    chunks = [pos.tobytes(), mesh.vertex_normals()[:, [0, 2, 1]].astype("<f4")]
-    chunks[1][:, 2] *= -1
-    chunks[1] = chunks[1].tobytes()
-    attributes = {"POSITION": 0, "NORMAL": 1}
-    accessors = [
-        {"bufferView": 0, "componentType": 5126, "count": len(pos), "type": "VEC3",
-         "min": pos.min(0).tolist(), "max": pos.max(0).tolist()},
-        {"bufferView": 1, "componentType": 5126, "count": len(pos), "type": "VEC3"},
-    ]
-    if mesh.colors is not None:  # glTF vertex colours are linear, not sRGB
-        srgb = mesh.colors / 255.0
-        linear = np.where(srgb <= 0.04045, srgb / 12.92, ((srgb + 0.055) / 1.055) ** 2.4)
-        chunks.append(linear.astype("<f4").tobytes())
-        attributes["COLOR_0"] = 2
-        accessors.append({"bufferView": 2, "componentType": 5126, "count": len(pos),
-                          "type": "VEC3"})
-    chunks.append(mesh.faces.astype("<u4").tobytes())
-    accessors.append({"bufferView": len(chunks) - 1, "componentType": 5125,
-                      "count": mesh.faces.size, "type": "SCALAR"})
+    blob = bytearray()
+    views: list[dict] = []
+    accessors: list[dict] = []
 
-    views, offset, blob = [], 0, b""
-    for i, chunk in enumerate(chunks):
-        target = 34963 if i == len(chunks) - 1 else 34962  # index / vertex data
-        views.append({"buffer": 0, "byteOffset": offset, "byteLength": len(chunk),
-                      "target": target})
-        blob += chunk + b"\0" * (-len(chunk) % 4)
-        offset = len(blob)
-    gltf = {
+    def add_view(data: bytes, target: int | None = None) -> int:
+        while len(blob) % 4:
+            blob.append(0)
+        view = {"buffer": 0, "byteOffset": len(blob), "byteLength": len(data)}
+        if target:
+            view["target"] = target
+        views.append(view)
+        blob.extend(data)
+        return len(views) - 1
+
+    def add_accessor(view: int | None, comp: int, count: int, kind: str, **extra) -> int:
+        acc = {"componentType": comp, "count": count, "type": kind, **extra}
+        if view is not None:
+            acc["bufferView"] = view
+        accessors.append(acc)
+        return len(accessors) - 1
+
+    bounds = {"min": pos.min(0).tolist(), "max": pos.max(0).tolist()}
+    primitive: dict = {"attributes": {}, "material": 0}
+    extensions_used: list[str] = []
+    if draco:
+        import DracoPy
+
+        uv = mesh.uvs.astype(np.float64) if textured else None
+        encoded = DracoPy.encode(
+            pos, idx.astype(np.uint32), quantization_bits=16, compression_level=7,
+            tex_coord=uv, normals=nrm.astype(np.float64), tex_coord_quantization_bits=14,
+            normal_quantization_bits=10, preserve_order=True,
+        )
+        ids = _draco_attribute_ids(encoded)
+        attrs = {"POSITION": add_accessor(None, 5126, len(pos), "VEC3", **bounds),
+                 "NORMAL": add_accessor(None, 5126, len(pos), "VEC3")}
+        if textured:
+            attrs["TEXCOORD_0"] = add_accessor(None, 5126, len(pos), "VEC2")
+        primitive["attributes"] = attrs
+        primitive["indices"] = add_accessor(None, 5125, idx.size, "SCALAR")
+        primitive["extensions"] = {"KHR_draco_mesh_compression": {
+            "bufferView": add_view(encoded),
+            "attributes": {name: ids[name] for name in attrs}}}
+        extensions_used.append("KHR_draco_mesh_compression")
+    else:
+        primitive["attributes"]["POSITION"] = add_accessor(
+            add_view(pos.tobytes(), 34962), 5126, len(pos), "VEC3", **bounds)
+        primitive["attributes"]["NORMAL"] = add_accessor(
+            add_view(nrm.tobytes(), 34962), 5126, len(pos), "VEC3")
+        if textured:
+            primitive["attributes"]["TEXCOORD_0"] = add_accessor(
+                add_view(mesh.uvs.astype("<f4").tobytes(), 34962), 5126, len(pos), "VEC2")
+        if vcol is not None:  # glTF vertex colours are linear, not sRGB
+            srgb = vcol / 255.0
+            linear = np.where(srgb <= 0.04045, srgb / 12.92, ((srgb + 0.055) / 1.055) ** 2.4)
+            primitive["attributes"]["COLOR_0"] = add_accessor(
+                add_view(linear.astype("<f4").tobytes(), 34962), 5126, len(pos), "VEC3")
+        primitive["indices"] = add_accessor(add_view(idx.tobytes(), 34963), 5125, idx.size, "SCALAR")
+
+    material: dict = {"pbrMetallicRoughness": {"baseColorFactor": [1, 1, 1, 1],
+                                               "metallicFactor": 0, "roughnessFactor": 1},
+                      "doubleSided": True}
+    images, textures = [], []
+    if textured:
+        for key, img, quality in (("baseColorTexture", mesh.texture, jpeg_quality),
+                                  ("normalTexture", mesh.normal_map, max(jpeg_quality, 95))):
+            if img is None:
+                continue
+            images.append({"bufferView": add_view(_encode_image(img, quality)),
+                           "mimeType": "image/jpeg"})
+            textures.append({"source": len(images) - 1, "sampler": 0})
+            ref = {"index": len(textures) - 1}
+            if key == "baseColorTexture":
+                material["pbrMetallicRoughness"][key] = ref
+            else:
+                material[key] = ref
+
+    gltf: dict = {
         "asset": {"version": "2.0", "generator": "img2mesh"},
         "scene": 0, "scenes": [{"nodes": [0]}], "nodes": [{"mesh": 0}],
-        "meshes": [{"primitives": [{"attributes": attributes, "indices": len(accessors) - 1,
-                                    "material": 0}]}],
-        "materials": [{"pbrMetallicRoughness": {"baseColorFactor": [1, 1, 1, 1],
-                                                "metallicFactor": 0, "roughnessFactor": 1},
-                       "doubleSided": True}],
-        "accessors": accessors, "bufferViews": views, "buffers": [{"byteLength": len(blob)}],
+        "meshes": [{"primitives": [primitive]}],
+        "materials": [material],
+        "accessors": accessors, "bufferViews": views,
     }
+    if images:
+        gltf["images"], gltf["textures"] = images, textures
+        gltf["samplers"] = [{"magFilter": 9729, "minFilter": 9987, "wrapS": 33071, "wrapT": 33071}]
+    if extensions_used:
+        gltf["extensionsUsed"] = gltf["extensionsRequired"] = extensions_used
+    while len(blob) % 4:
+        blob.append(0)
+    gltf["buffers"] = [{"byteLength": len(blob)}]
     js = json.dumps(gltf, separators=(",", ":")).encode()
     js += b" " * (-len(js) % 4)
     with open(path, "wb") as fh:
         fh.write(struct.pack("<III", 0x46546C67, 2, 12 + 8 + len(js) + 8 + len(blob)))
         fh.write(struct.pack("<II", len(js), 0x4E4F534A) + js)
-        fh.write(struct.pack("<II", len(blob), 0x004E4942) + blob)
+        fh.write(struct.pack("<II", len(blob), 0x004E4942) + bytes(blob))
+
+
+def _draco_attribute_ids(encoded: bytes) -> dict[str, int]:
+    """Read the unique id of each attribute from a Draco buffer."""
+    import DracoPy
+
+    mesh = DracoPy.decode(encoded)
+    ids = {}
+    for attr in mesh.attributes:
+        kind = attr["attribute_type"]
+        name = {DracoPy.AttributeType.POSITION: "POSITION",
+                DracoPy.AttributeType.NORMAL: "NORMAL",
+                DracoPy.AttributeType.TEX_COORD: "TEXCOORD_0"}.get(kind)
+        if name:
+            ids[name] = int(attr["unique_id"])
+    return ids

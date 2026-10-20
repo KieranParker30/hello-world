@@ -12,7 +12,7 @@ dependencies = ["numpy>=1.22", "Pillow>=9.0"]
 
 [project.optional-dependencies]
 ai = ["torch", "transformers>=4.40"]
-photo = ["pycolmap>=3.11", "opencv-python-headless>=4.8", "scipy>=1.10"]
+photo = ["pycolmap>=3.11", "opencv-python-headless>=4.8", "scipy>=1.10", "xatlas>=0.0.9", "fast-simplification>=0.1.7", "DracoPy>=1.4"]
 test = ["pytest"]
 
 [project.scripts]

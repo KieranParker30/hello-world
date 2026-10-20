@@ -1,17 +1,19 @@
-"""Handheld photos -> textured 3D model (full photogrammetry).
+"""Handheld photos -> textured, web-ready 3D model (full photogrammetry).
 
 Pipeline:
 1. Structure from Motion with COLMAP (pycolmap): find each photo's camera
    position, orientation and lens from matched SIFT features.
 2. Dense stereo: for each photo pick the best neighbouring photos, rectify each
-   pair and run OpenCV semi-global matching to get a depth map. Depths from two
-   neighbours must agree, which removes most bad matches.
+   pair and run OpenCV semi-global matching to get a depth map. A depth is kept
+   only where at least two pairs agree, which removes most bad matches.
 3. Fusion: integrate all depth maps into a truncated signed distance field
-   (TSDF) voxel grid, averaging out noise and recording colour.
-4. Meshing: extract the surface with surface nets, keeping only parts that
-   cameras actually observed, and colour each vertex.
+   (TSDF) voxel grid, averaging out noise.
+4. Meshing: extract the detailed surface with surface nets, keeping only parts
+   that cameras actually observed.
+5. Texturing (texture.py): decimate, UV-unwrap, bake a colour texture from the
+   full-resolution photos and a normal map from the detailed surface.
 
-Needs: pip install 'img2mesh[photo]'  (pycolmap, opencv-python-headless, scipy).
+Needs: pip install 'img2mesh[photo]'.
 """
 
 from __future__ import annotations
@@ -31,12 +33,15 @@ from .surface import surface_nets
 def _require():
     try:
         import cv2
+        import fast_simplification  # noqa: F401
         import pycolmap
         import scipy  # noqa: F401
+        import xatlas  # noqa: F401
     except ImportError as exc:
         raise SystemExit(
             "Photogrammetry needs extra packages:  pip install 'img2mesh[photo]'\n"
-            "(or: pip install pycolmap opencv-python-headless scipy)"
+            "(or: pip install pycolmap opencv-python-headless scipy xatlas "
+            "fast-simplification DracoPy)"
         ) from exc
     return cv2, pycolmap
 
@@ -50,6 +55,8 @@ class View:
     image: np.ndarray  # (h, w, 3) uint8 RGB at dense resolution
     point_ids: set = field(default_factory=set)
     depth: np.ndarray | None = None
+    photo: Path | None = None  # full-resolution undistorted photo
+    K_photo: np.ndarray | None = None  # intrinsics for `photo`
 
     @property
     def centre(self) -> np.ndarray:
@@ -75,7 +82,7 @@ def run_sfm(paths: list[str], work: Path, max_size: int = 1600, log=print):
             im.save(images / f"{i:04d}_{Path(p).stem}.jpg", quality=95)
 
     db = work / "database.db"
-    log(f"[1/4] Finding features in {len(paths)} photos...")
+    log(f"[1/5] Finding features in {len(paths)} photos...")
     pycolmap.extract_features(db, images)
     log("      Matching photos against each other...")
     pycolmap.match_exhaustive(db)
@@ -118,10 +125,11 @@ def load_views(rec, image_dir: Path, dense_size: int) -> tuple[list[View], np.nd
         K = np.array([[fx * sx, 0, cx * sx - 0.5],
                       [0, fy * sy, cy * sy - 0.5],
                       [0, 0, 1]])
-        pose = img.cam_from_world()
-        m = pose.matrix()
+        K_photo = np.array([[fx, 0, cx - 0.5], [0, fy, cy - 0.5], [0, 0, 1]])
+        m = img.cam_from_world().matrix()
         ids = {p.point3D_id for p in img.points2D if p.has_point3D()}
-        views.append(View(img.name, K, m[:, :3].copy(), m[:, 3].copy(), rgb, ids))
+        views.append(View(img.name, K, m[:, :3].copy(), m[:, 3].copy(), rgb, ids,
+                          photo=image_dir / img.name, K_photo=K_photo))
     points = np.array([p.xyz for p in rec.points3D.values()])
     return views, points
 
@@ -267,6 +275,17 @@ def compute_depth(ref: View, srcs: list[View], points: dict, tolerance: float = 
 # ------------------------------------------------------------------------ 3. Fusion
 
 
+def aim_point(views: list[View]) -> np.ndarray:
+    """Least-squares point closest to every camera's line of sight."""
+    A = np.zeros((3, 3))
+    b = np.zeros(3)
+    for v in views:
+        P = np.eye(3) - np.outer(v.direction, v.direction)
+        A += P
+        b += P @ v.centre
+    return np.linalg.lstsq(A, b, rcond=None)[0]
+
+
 def fusion_bounds(views: list[View], points: np.ndarray, crop: float = 0.75, margin: float = 0.05):
     """Region to reconstruct: around the spot all the cameras are aimed at.
 
@@ -274,15 +293,7 @@ def fusion_bounds(views: list[View], points: np.ndarray, crop: float = 0.75, mar
     camera distance; raise it to include more surroundings.
     """
     centres = np.array([v.centre for v in views])
-    dirs = np.array([v.direction for v in views])
-    # Least-squares point closest to every camera's line of sight.
-    A = np.zeros((3, 3))
-    b = np.zeros(3)
-    for c, d in zip(centres, dirs):
-        P = np.eye(3) - np.outer(d, d)
-        A += P
-        b += P @ c
-    focus = np.linalg.lstsq(A, b, rcond=None)[0]
+    focus = aim_point(views)
     radius = crop * np.median(np.linalg.norm(centres - focus, axis=1))
     near = points[np.linalg.norm(points - focus, axis=1) < radius]
     if len(near) < 20:
@@ -292,16 +303,50 @@ def fusion_bounds(views: list[View], points: np.ndarray, crop: float = 0.75, mar
     return lo - pad, hi + pad
 
 
+def find_ground(points: np.ndarray, up: np.ndarray, focus_height: float,
+                iterations: int = 500, seed: int = 0):
+    """Dominant roughly horizontal plane below the object: returns (normal, offset)
+    with normal . x = offset on the plane and the normal pointing up, or None."""
+    if len(points) < 50:
+        return None
+    rng = np.random.default_rng(seed)
+    heights = points @ up
+    tol = 0.01 * (np.percentile(heights, 99) - np.percentile(heights, 1))
+    best, best_count = None, 0
+    for _ in range(iterations):
+        a, b, c = points[rng.choice(len(points), 3, replace=False)]
+        n = np.cross(b - a, c - a)
+        if np.linalg.norm(n) < 1e-12:
+            continue
+        n /= np.linalg.norm(n)
+        if n @ up < 0:
+            n = -n
+        if n @ up < np.cos(np.radians(20)):  # must be roughly level
+            continue
+        d = n @ a
+        count = int((np.abs(points @ n - d) < tol).sum())
+        if count > best_count:
+            best, best_count = (n, d), count
+    if best is None or best_count < 0.08 * len(points):
+        return None
+    n, d = best
+    if d >= focus_height:  # a plane above the object's middle is not the ground
+        return None
+    inliers = points[np.abs(points @ n - d) < tol]
+    centre = inliers.mean(0)
+    _, _, vt = np.linalg.svd(inliers - centre)  # refine with least squares
+    n = vt[2] if vt[2] @ up > 0 else -vt[2]
+    return n, float(n @ centre) + 2 * tol
+
+
 def fuse(views: list[View], lo: np.ndarray, hi: np.ndarray, resolution: int,
          trunc_voxels: float = 4.0):
-    """Integrate depth maps into a TSDF; returns (tsdf, weight, colour, voxel size)."""
+    """Integrate depth maps into a TSDF; returns (tsdf, weight, voxel size)."""
     voxel = (hi - lo).max() / resolution
     dims = np.maximum(np.ceil((hi - lo) / voxel).astype(int), 2)
     trunc = trunc_voxels * voxel
     tsdf = np.ones(dims, np.float32)
     weight = np.zeros(dims, np.float32)
-    colour = np.zeros(tuple(dims) + (3,), np.float32)
-    cweight = np.zeros(dims, np.float32)
 
     gx, gy = np.meshgrid(lo[0] + (np.arange(dims[0]) + 0.5) * voxel,
                          lo[1] + (np.arange(dims[1]) + 0.5) * voxel, indexing="ij")
@@ -329,29 +374,52 @@ def fuse(views: list[View], lo: np.ndarray, hi: np.ndarray, resolution: int,
             wt = weight[ix, iy, k]
             tsdf[ix, iy, k] = (tsdf[ix, iy, k] * wt + val) / (wt + 1)
             weight[ix, iy, k] = wt + 1
-            near = np.abs(val) < 1
-            if near.any():
-                cx_, cy_ = ix[near], iy[near]
-                colour[cx_, cy_, k] += view.image[vi[use][near], ui[use][near]]
-                cweight[cx_, cy_, k] += 1
-    colour /= np.maximum(cweight, 1)[..., None]
-    return tsdf, weight, colour, cweight, voxel
+    return tsdf, weight, voxel
+
+
+def smooth_tsdf(tsdf: np.ndarray, valid: np.ndarray, sigma: float) -> np.ndarray:
+    """Gaussian-smooth the distance field using observed voxels only."""
+    if sigma <= 0:
+        return tsdf
+    from scipy.ndimage import gaussian_filter
+
+    m = valid.astype(np.float32)
+    num = gaussian_filter(tsdf * m, sigma)
+    den = gaussian_filter(m, sigma)
+    return np.where(den > 1e-3, num / np.maximum(den, 1e-3), tsdf).astype(np.float32)
+
+
+def field_normals(tsdf: np.ndarray, valid: np.ndarray, lo: np.ndarray, voxel: float):
+    """Function giving the detailed surface's outward normal at world points."""
+    dims = np.array(tsdf.shape)
+
+    def sample(g: np.ndarray) -> np.ndarray:  # trilinear, g in voxel-index units
+        i0 = np.clip(np.floor(g).astype(int), 0, dims - 2)
+        f = np.clip(g - i0, 0, 1)
+        out = np.zeros(len(g), np.float32)
+        for dx, dy, dz in np.ndindex(2, 2, 2):
+            wgt = ((f[:, 0] if dx else 1 - f[:, 0]) * (f[:, 1] if dy else 1 - f[:, 1])
+                   * (f[:, 2] if dz else 1 - f[:, 2]))
+            out += wgt * tsdf[i0[:, 0] + dx, i0[:, 1] + dy, i0[:, 2] + dz]
+        return out
+
+    def normals(points: np.ndarray):
+        out_n = np.zeros_like(points)
+        ok = np.zeros(len(points), bool)
+        for start in range(0, len(points), 2_000_000):
+            sl = slice(start, start + 2_000_000)
+            g = (points[sl] - lo) / voxel - 0.5
+            grad = np.stack([sample(g + e) - sample(g - e) for e in np.eye(3)], axis=1)
+            length = np.linalg.norm(grad, axis=1)
+            out_n[sl] = grad / np.maximum(length, 1e-12)[:, None]
+            gi = np.clip(np.round(g).astype(int), 0, dims - 1)
+            ok[sl] = valid[gi[:, 0], gi[:, 1], gi[:, 2]] & (length > 1e-6)
+        return out_n, ok
+
+    return normals
 
 
 # ----------------------------------------------------------------------- 4. Meshing
-
-
-def _vertex_colours(verts_grid: np.ndarray, colour: np.ndarray, cweight: np.ndarray):
-    """Colour each vertex from the nearest voxels that recorded a colour."""
-    acc = np.zeros((len(verts_grid), 3))
-    tot = np.zeros(len(verts_grid))
-    base = np.floor(verts_grid).astype(int)
-    for offset in np.ndindex(2, 2, 2):
-        idx = np.clip(base + offset, 0, np.array(cweight.shape) - 1)
-        wt = cweight[idx[:, 0], idx[:, 1], idx[:, 2]] > 0
-        acc += colour[idx[:, 0], idx[:, 1], idx[:, 2]] * wt[:, None]
-        tot += wt
-    return np.clip(acc / np.maximum(tot, 1)[:, None], 0, 255).astype(np.uint8)
 
 
 def _largest_component(mesh: Mesh, keep_fraction: float = 0.02) -> Mesh:
@@ -387,20 +455,47 @@ def _up_rotation(views: list[View]) -> np.ndarray:
     return np.eye(3) + s * Kx + (1 - c) * Kx @ Kx
 
 
+def _facing_rotation(mesh: Mesh, views: list[View], R_up: np.ndarray) -> np.ndarray:
+    """Turn about +Z so the photographed side faces -Y (the viewer's side in glTF)."""
+    centre = mesh.vertices.mean(axis=0)
+    d = np.mean([v.centre @ R_up.T - centre for v in views], axis=0)
+    angle = -np.pi / 2 - np.arctan2(d[1], d[0])
+    c, s = np.cos(angle), np.sin(angle)
+    return np.array([[c, -s, 0], [s, c, 0], [0, 0, 1]])
+
+
+QUALITY = {  # image size, depth-map size, voxels, triangles, texture size
+    "draft": dict(max_image_size=1600, dense_size=1000, resolution=200, faces=50_000, texture_size=2048),
+    "high": dict(max_image_size=2000, dense_size=1600, resolution=360, faces=150_000, texture_size=4096),
+    "ultra": dict(max_image_size=3000, dense_size=2000, resolution=480, faces=400_000, texture_size=8192),
+}
+
+
 def reconstruct(
     paths: list[str],
-    resolution: int = 200,
+    quality: str = "high",
     size: float = 100.0,
-    max_image_size: int = 1600,
-    dense_size: int = 1000,
+    resolution: int | None = None,
+    faces: int | None = None,
+    texture_size: int | None = None,
+    max_image_size: int | None = None,
+    dense_size: int | None = None,
     neighbours: int = 4,
     min_views: int = 2,
     crop: float = 0.75,
+    smooth: float = 0.7,
+    remove_ground: bool = False,
     work_dir: str | None = None,
     log=print,
 ) -> Mesh:
+    """Photos -> UV-textured mesh with a normal map, sized `size` mm, facing -Y, Z up."""
     if len(paths) < 3:
         raise ValueError("Photogrammetry needs at least 3 photos (20-60 works best)")
+    preset = dict(QUALITY[quality])
+    for key, val in dict(resolution=resolution, faces=faces, texture_size=texture_size,
+                         max_image_size=max_image_size, dense_size=dense_size).items():
+        if val is not None:
+            preset[key] = val
     temp = None
     if work_dir is None:
         temp = tempfile.mkdtemp(prefix="img2mesh_")
@@ -411,11 +506,11 @@ def reconstruct(
             raise ValueError(f"Work folder {work} already has a reconstruction; "
                              "use an empty folder")
     try:
-        rec, image_dir = run_sfm(paths, work, max_image_size, log)
-        views, sparse = load_views(rec, image_dir, dense_size)
+        rec, image_dir = run_sfm(paths, work, preset["max_image_size"], log)
+        views, sparse = load_views(rec, image_dir, preset["dense_size"])
         point_map = {pid: p.xyz for pid, p in rec.points3D.items()}
 
-        log(f"[2/4] Computing depth maps for {len(views)} photos...")
+        log(f"[2/5] Computing depth maps for {len(views)} photos...")
         nbrs = pick_neighbours(views, point_map, neighbours)
         for i, view in enumerate(views):
             view.depth = compute_depth(view, [views[j] for j in nbrs[i]], point_map)
@@ -423,19 +518,52 @@ def reconstruct(
             raise ValueError("Dense matching found no depth; the photos may be too far "
                              "apart or the surface too plain")
 
-        log("[3/4] Fusing depth maps...")
+        log("[3/5] Fusing depth maps...")
         lo, hi = fusion_bounds(views, sparse, crop)
-        tsdf, weight, colour, cweight, voxel = fuse(views, lo, hi, resolution)
-
-        log("[4/4] Building the mesh...")
+        tsdf, weight, voxel = fuse(views, lo, hi, preset["resolution"])
+        for v in views:
+            v.depth = v.image = None  # free memory before texturing
         valid = weight >= min_views
-        mesh = surface_nets(-tsdf, 0.0, valid=valid)  # inside = behind the surface
-        if len(mesh.faces) == 0:
-            raise ValueError("No surface found; try more photos or a lower --resolution")
-        colours = _vertex_colours(mesh.vertices, colour, cweight)
-        world = lo + (mesh.vertices + 0.5) * voxel
-        mesh = _largest_component(Mesh(world @ _up_rotation(views).T, mesh.faces, colours))
-        return mesh.scaled_to(size)
+        del weight
+        R_up = _up_rotation(views)
+        if remove_ground:
+            up = R_up[2]  # world direction that becomes +Z
+            nearby = sparse[(sparse >= lo).all(1) & (sparse <= hi).all(1)]
+            plane = find_ground(nearby, up, float(aim_point(views) @ up))
+            if plane is None:
+                log("      No ground plane found; keeping everything")
+            else:
+                n, d = plane
+                axes = [lo[k] + (np.arange(tsdf.shape[k]) + 0.5) * voxel for k in range(3)]
+                height = (axes[0][:, None, None] * n[0] + axes[1][None, :, None] * n[1]
+                          + axes[2][None, None, :] * n[2])
+                valid &= height > d
+                log("      Removed the ground plane")
+        tsdf = smooth_tsdf(tsdf, valid, smooth)
+
+        log("[4/5] Building the mesh...")
+        dense = surface_nets(-tsdf, 0.0, valid=valid)  # inside = behind the surface
+        if len(dense.faces) == 0:
+            raise ValueError("No surface found; try more photos or a lower quality setting")
+        dense = _largest_component(Mesh(lo + (dense.vertices + 0.5) * voxel, dense.faces))
+        log(f"      Detailed surface: {len(dense.faces):,} triangles")
+
+        log(f"[5/5] Texturing ({preset['faces']:,} triangles, "
+            f"{preset['texture_size']}px textures)...")
+        from .texture import Camera, bake, decimate, unwrap
+
+        low = unwrap(decimate(dense, preset["faces"]), preset["texture_size"])
+        cameras = []
+        for v in views:
+            with Image.open(v.photo) as im:
+                cameras.append(Camera(v.K_photo, v.R, v.t, np.asarray(im.convert("RGB"))))
+        texture, normal_map, normals = bake(
+            low, cameras, preset["texture_size"], field_normals(tsdf, valid, lo, voxel), log=log)
+        model = Mesh(low.vertices, low.faces, uvs=low.uvs, normals=normals,
+                     texture=texture, normal_map=normal_map)
+        model = model.rotated(R_up)
+        model = model.rotated(_facing_rotation(model, views, R_up))
+        return model.scaled_to(size)
     finally:
         if temp is not None:
             shutil.rmtree(temp, ignore_errors=True)

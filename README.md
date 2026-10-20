@@ -6,7 +6,7 @@ Three ways to build a model:
 
 | Mode | Input | Output |
 |------|-------|--------|
-| `scan` | **20–60 handheld photos** of an object or scene | Full photogrammetry: a coloured 3D surface with real detail, including dents, holes and hollows. |
+| `scan` | **20–60 handheld photos** of an object or scene | Full photogrammetry: a website-ready textured 3D model (`.glb`) with real detail, including dents, holes and hollows. |
 | `relief` | **one** image | A solid slab whose surface follows the picture: a bas-relief, embossed logo, terrain or lithophane. With `--depth ai`, a neural network estimates real depth from a photo. |
 | `carve` | **several** photos taken around an object | A full 360° model, built by carving away everything outside the object's outline in each photo (the "visual hull"). |
 
@@ -20,40 +20,88 @@ pip install ".[photo]"   # optional: photogrammetry (COLMAP via pycolmap, OpenCV
 pip install ".[ai]"      # optional: AI depth estimation (PyTorch + transformers)
 ```
 
-## Handheld photos → textured 3D model (photogrammetry)
+## Handheld photos → textured 3D model for the web (photogrammetry)
 
 ```bash
-img2mesh scan photos/*.jpg -o statue.glb
+img2mesh scan photos/*.jpg -o statue.glb --html
 ```
 
-Open the `.glb` in Windows 3D Viewer, macOS Preview/Quick Look, Blender, or any online glTF viewer. It also works on phones.
+This produces a website-ready `statue.glb` and a `statue.html` showing it with [`<model-viewer>`](https://modelviewer.dev). Copy the `<model-viewer>` tag from that page into your site, next to the `.glb` file.
 
-How it works:
+The model is built the way professional scanning tools build theirs:
 
-1. **Camera solving** ([COLMAP](https://colmap.github.io/)): matches features between photos to find where each one was taken from and what lens was used.
-2. **Depth maps**: each photo is paired with its 4 best neighbours and run through OpenCV's semi-global stereo matcher. A depth is kept only where at least two of the pairs agree.
-3. **Fusion**: all depth maps are merged into a voxel grid (a TSDF), which averages out noise and records colour.
-4. **Meshing**: the surface is extracted and coloured from the photos. Parts no camera saw are left open, not guessed.
+- **Texture map.** Colour comes from your full-resolution photos. Each texel uses the photos that see that spot best (facing it, close up, not blocked by anything else) and blends gently between neighbouring photos, so you don't see seams.
+- **Normal map.** Fine surface detail (bark, grain, scratches) is baked from the high-resolution scan, so a lighter mesh still catches the light like the detailed one.
+- **Web-sized mesh.** The detailed surface is reduced to a sensible triangle budget with quadric decimation and UV-unwrapped with [xatlas](https://github.com/jpcy/xatlas).
+- **Draco compression.** Geometry is compressed with Draco, which `<model-viewer>`, three.js and Babylon.js all support. Use `--no-draco` for tools that don't.
+- **glTF conventions.** Metres, Y up, centred, with the photographed side facing the default camera.
 
-Tips for good photos:
+### Putting it on your website
 
-1. Walk around the object and take a photo every 10–15°, so each spot appears in **at least 3 photos**. Go round at two heights if you can.
-2. The object should fill most of the frame. Keep everything sharp: no motion blur and no zooming between shots.
-3. Use soft, even light (overcast outdoors is ideal). Avoid flash.
+The simplest way is Google's [`<model-viewer>`](https://modelviewer.dev) web component. It handles Draco, lighting, touch controls and AR on phones:
+
+```html
+<script type="module" src="https://cdn.jsdelivr.net/npm/@google/model-viewer@4.0.0/dist/model-viewer.min.js"></script>
+
+<model-viewer src="statue.glb" alt="3D model of the statue"
+  camera-controls touch-action="pan-y" auto-rotate
+  shadow-intensity="1" environment-image="neutral" ar
+  style="width: 100%; height: 500px">
+</model-viewer>
+```
+
+With [three.js](https://threejs.org), give `GLTFLoader` a `DRACOLoader`:
+
+```js
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+import { DRACOLoader } from 'three/addons/loaders/DRACOLoader.js';
+
+const draco = new DRACOLoader();
+draco.setDecoderPath('https://www.gstatic.com/draco/versioned/decoders/1.5.7/');
+const loader = new GLTFLoader();
+loader.setDRACOLoader(draco);
+loader.load('statue.glb', (gltf) => scene.add(gltf.scene));
+```
+
+Serve the page over `http(s)://`. Browsers won't load models from `file://` pages.
+
+### Quality presets
+
+| `--quality` | Use it for | Triangles | Textures |
+|-------------|-----------|-----------|----------|
+| `draft` | Quick check that your photos work | 50,000 | 2048 × 2048 |
+| `high` (default) | Websites: sharp on desktop and phones | 150,000 | 4096 × 4096 |
+| `ultra` | Hero pieces, zoomed-in viewing, archiving | 400,000 | 8192 × 8192 |
+
+`ultra` textures are larger than some phones can display (many cap at 4096 px), so use `high` for pages that need to work everywhere. Override any part with `--faces` and `--texture-size`.
+
+For even smaller downloads, you can re-compress the textures to KTX2 or WebP with [glTF-Transform](https://gltf-transform.dev): `npx @gltf-transform/cli optimize statue.glb statue-small.glb --texture-compress webp`.
+
+### Taking the photos
+
+1. Walk around the object and take a photo every 10–15°, so each spot appears in **at least 3 photos**. Go round at two or three heights, and take a few close-ups of detailed areas.
+2. The object should fill most of the frame. Keep everything sharp: no motion blur and no zooming between shots. Use the highest resolution your camera has.
+3. Use soft, even light (overcast outdoors or a light tent is ideal). Avoid flash and harsh shadows, because the lighting ends up baked into the texture.
 4. Matte, textured surfaces work best. Shiny, transparent and plain single-colour surfaces give the matcher nothing to lock onto. A light dusting of powder or some masking tape helps.
-5. Don't move the object between shots. Moving the camera is fine.
+5. Don't move the object between shots; move the camera. For objects on a table, add `--remove-ground` to cut the table away.
+
+### All options
 
 | Option | Default | Meaning |
 |--------|---------|---------|
-| `-o` | `model.glb` | `.glb`, `.ply` and `.obj` keep the colours; `.stl` is shape only |
-| `--resolution` | 200 | Voxels on the longest side. Higher means more detail, more time and more memory. |
-| `--size` | 100 | Largest dimension in mm. Photos have no real-world scale, so set this yourself. |
+| `-o` | `model.glb` | `.glb` for websites. `.obj` writes the texture and normal map as JPEGs next to it. `.ply`/`.stl` have no texture maps. |
+| `--quality` | `high` | Preset, see above |
+| `--faces` | from preset | Triangle budget for the final model |
+| `--texture-size` | from preset | Texture width and height in pixels |
+| `--resolution` | from preset | Voxels on the longest side of the detailed scan |
+| `--size` | 100 | Largest dimension in mm. Photos have no real-world scale, so set this to the real object size if it matters. |
+| `--remove-ground` | off | Cut away the table or floor the object stands on |
 | `--crop` | 0.75 | How much of the surroundings to keep around the object (raise it if parts get cut off) |
-| `--image-size` | 1600 | Photo size used for camera solving |
-| `--dense-size` | 1000 | Photo size used for depth maps |
+| `--html` | off | Also write a `<model-viewer>` web page for the model |
+| `--no-draco` | off | Store the geometry uncompressed |
 | `--work-dir` | temp | Keep the intermediate files (the COLMAP project can be opened in the COLMAP GUI) |
 
-It runs on a normal CPU, no graphics card needed: 41 phone photos take about 3–4 minutes. The output is a surface rather than a solid. To 3D-print it, close it first, for example with *Make Manifold* in PrusaSlicer or *Solidify* in Blender.
+It runs on a normal CPU, no graphics card needed. Parts no camera saw are left open, not guessed, so the underside of an object on a table is usually open.
 
 ## One image → relief
 
@@ -111,7 +159,7 @@ from img2mesh.photogrammetry import reconstruct
 
 image_to_relief("logo.png", width=80, max_height=4).save("logo.stl")
 images_to_model(["a.jpg", "b.jpg", "c.jpg", "d.jpg"], size=50).save("model.obj")
-reconstruct(sorted(glob.glob("photos/*.jpg"))).save("scan.glb")
+reconstruct(sorted(glob.glob("photos/*.jpg")), quality="high").save("scan.glb", draco=True)
 ```
 
 ## Tests

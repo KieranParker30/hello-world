@@ -57,7 +57,7 @@ def test_reconstruction_matches_ground_truth_including_dent(scene):
     for i, v in enumerate(views):
         v.depth = pg.compute_depth(v, [views[j] for j in nbrs[i]], points)
     lo, hi = pg.fusion_bounds(views, sparse)
-    tsdf, weight, _, _, voxel = pg.fuse(views, lo, hi, 120)
+    tsdf, weight, voxel = pg.fuse(views, lo, hi, 120)
     mesh = surface_nets(-tsdf, 0.0, valid=weight >= 2)
     world = s * (lo + (mesh.vertices + 0.5) * voxel) @ R.T + t
 
@@ -69,17 +69,32 @@ def test_reconstruction_matches_ground_truth_including_dent(scene):
     assert deep.sum() > 20
 
 
-def test_full_pipeline_writes_coloured_glb(scene, tmp_path):
+def test_full_pipeline_writes_textured_web_glb(scene, tmp_path):
     paths, _, _ = scene
-    mesh = pg.reconstruct(paths, resolution=80, size=50, log=lambda *a: None)
-    assert mesh.colors is not None and len(mesh.faces) > 500
+    mesh = pg.reconstruct(paths, quality="draft", faces=4000, texture_size=512, size=50,
+                          log=lambda *a: None)
+    assert mesh.texture.shape == (512, 512, 3) and mesh.normal_map.shape == (512, 512, 3)
+    assert mesh.uvs is not None and 3000 < len(mesh.faces) <= 4000
     assert (mesh.bounds()[1] - mesh.bounds()[0]).max() == pytest.approx(50)
+    # The texture holds the scene's colours, not a blank fill.
+    assert mesh.texture.reshape(-1, 3).std(axis=0).mean() > 20
 
     out = tmp_path / "scan.glb"
-    mesh.save(out)
+    mesh.save(out, draco=True)
     data = out.read_bytes()
     magic, version, length = struct.unpack("<III", data[:12])
     assert magic == 0x46546C67 and version == 2 and length == len(data)
     js_len = struct.unpack("<I", data[12:16])[0]
     gltf = json.loads(data[20:20 + js_len])
-    assert "COLOR_0" in gltf["meshes"][0]["primitives"][0]["attributes"]
+    assert gltf["extensionsRequired"] == ["KHR_draco_mesh_compression"]
+    assert "normalTexture" in gltf["materials"][0]
+
+
+def test_find_ground_detects_floor_under_object():
+    rng = np.random.default_rng(1)
+    floor = np.c_[rng.uniform(-2, 2, (600, 2)), rng.normal(0, 0.002, 600)]
+    box = rng.uniform([-0.5, -0.5, 0.0], [0.5, 0.5, 1.0], (400, 3))
+    n, d = pg.find_ground(np.vstack([floor, box]), np.array([0, 0, 1.0]), focus_height=0.5)
+    assert n[2] > 0.99 and 0 < d < 0.08
+    # Nothing level below the object: no ground.
+    assert pg.find_ground(box, np.array([0, 0, 1.0]), focus_height=0.5) is None
