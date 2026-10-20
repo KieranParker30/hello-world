@@ -611,10 +611,10 @@ def reconstruct(
         for v in views:
             with Image.open(v.photo) as im:
                 cameras.append(Camera(v.K_photo, v.R, v.t, np.asarray(im.convert("RGB"))))
-        texture, normal_map, normals = bake(
+        texture, normal_map, normals, tangents = bake(
             low, cameras, preset["texture_size"], field_normals(tsdf, valid, lo, voxel), log=log)
         model = Mesh(low.vertices, low.faces, uvs=low.uvs, normals=normals,
-                     texture=texture, normal_map=normal_map)
+                     texture=texture, normal_map=normal_map, tangents=tangents)
         model = model.rotated(R_up)
         model = model.rotated(_facing_rotation(model, views, R_up))
         return model.scaled_to(size)

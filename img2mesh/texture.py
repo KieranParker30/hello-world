@@ -80,6 +80,21 @@ def _tangents(mesh: Mesh) -> tuple[np.ndarray, np.ndarray]:
     return T, B
 
 
+def tangent_frames(mesh: Mesh, normals: np.ndarray) -> np.ndarray:
+    """glTF TANGENT attribute (N, 4): xyz along +u, orthogonal to the normal;
+    w makes the bitangent cross(N, T) * w point along +v (checked against real
+    geometry in three.js, the reference glTF renderer)."""
+    Tv, Bv = _tangents(mesh)
+    T = Tv - normals * np.einsum("nd,nd->n", normals, Tv)[:, None]
+    bad = np.linalg.norm(T, axis=1) < 1e-12
+    if bad.any():  # no usable UV direction: any vector perpendicular to the normal
+        alt = np.where(np.abs(normals[bad, 0:1]) < 0.9, [[1.0, 0, 0]], [[0, 1.0, 0]])
+        T[bad] = np.cross(normals[bad], alt)
+    T = _normalize(T)
+    w = np.where(np.einsum("nd,nd->n", np.cross(normals, T), Bv) < 0, -1.0, 1.0)
+    return np.hstack([T, w[:, None]])
+
+
 def _normalize(a: np.ndarray) -> np.ndarray:
     n = np.linalg.norm(a, axis=-1, keepdims=True)
     return a / np.where(n == 0, 1, n)
@@ -126,15 +141,17 @@ def bake(
     field: Callable[[np.ndarray], tuple[np.ndarray, np.ndarray]] | None = None,
     visibility_size: int = 1000,
     log=print,
-) -> tuple[np.ndarray, np.ndarray | None, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray | None, np.ndarray, np.ndarray]:
     """Bake colour (and, given `field`, a normal map) for a UV-mapped mesh.
 
     `field(points)` returns (outward normals, valid mask) of the detailed
-    surface at world points. Returns (texture, normal_map, vertex_normals).
+    surface at world points. Returns (texture, normal_map, vertex_normals,
+    tangents), where tangents is the glTF TANGENT attribute the normal map
+    was baked against.
     """
     V, F, UV = mesh.vertices, mesh.faces, mesh.uvs
     vnorm = mesh.vertex_normals()
-    Tv, Bv = _tangents(mesh)
+    tangents = tangent_frames(mesh, vnorm)
 
     # Which surface point does each texel show?
     fid, bary, _ = rasterize(UV * size - 0.5, None, F, size, size)
@@ -224,12 +241,12 @@ def bake(
     normal_map = None
     if field is not None:
         log("      Baking normal map from the detailed surface...")
-        Tn = _normalize(np.einsum("nk,nkd->nd", w, Tv[F[f]]))
-        Bdv = np.einsum("nk,nkd->nd", w, Bv[F[f]])
+        # Same frame a glTF renderer builds per pixel from the exported tangents:
+        # interpolated T and N, bitangent = cross(N, T) * w along +v.
+        Tn = np.einsum("nk,nkd->nd", w, tangents[F[f], :3])
         Tn = _normalize(Tn - N * np.einsum("nd,nd->n", N, Tn)[:, None])
-        up = np.cross(N, Tn)
-        # glTF tangent space: +Y points up the image, i.e. against dP/dv.
-        up *= np.where(np.einsum("nd,nd->n", up, -Bdv) < 0, -1.0, 1.0)[:, None]
+        sign = np.where(np.einsum("nk,nk->n", w, tangents[F[f], 3]) < 0, -1.0, 1.0)
+        up = np.cross(N, Tn) * sign[:, None]
         detail_n, valid = field(P)
         detail_n = np.where(valid[:, None], detail_n, N)
         ts = np.stack([np.einsum("nd,nd->n", detail_n, Tn),
@@ -244,4 +261,4 @@ def bake(
         filled = fill_holes(nm.reshape(size, size, 3), nm_known.reshape(size, size))
         normal_map = np.clip(filled + 0.5, 0, 255).astype(np.uint8)
 
-    return texture, normal_map, vnorm
+    return texture, normal_map, vnorm, tangents

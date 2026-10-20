@@ -48,8 +48,11 @@ def _plane_scene(size=64):
 
 def test_bake_projects_photo_onto_texture():
     mesh, cam, size = _plane_scene()
-    texture, normal_map, normals = bake(mesh, [cam], size, log=lambda *a: None)
+    texture, normal_map, normals, tangents = bake(mesh, [cam], size, log=lambda *a: None)
     assert normal_map is None and np.allclose(normals[:, 2], 1)
+    # +u runs along world +x and +v along world -y; the bitangent follows +v.
+    assert np.allclose(tangents[:, :3], [1, 0, 0])
+    assert np.allclose(np.cross(normals, tangents[:, :3]) * tangents[:, 3:], [0, -1, 0])
 
     def texel(u, v):
         return texture[int(v * size), int(u * size)].astype(int)
@@ -67,7 +70,7 @@ def test_bake_normal_map_is_flat_for_a_flat_field():
     def field(points):
         return np.tile([0.0, 0.0, 1.0], (len(points), 1)), np.ones(len(points), bool)
 
-    _, normal_map, _ = bake(mesh, [cam], size, field=field, log=lambda *a: None)
+    _, normal_map, _, _ = bake(mesh, [cam], size, field=field, log=lambda *a: None)
     assert np.abs(normal_map.reshape(-1, 3).astype(int) - [128, 128, 255]).max() <= 1
 
 
@@ -81,15 +84,16 @@ def test_textured_glb(tmp_path, draco):
     if draco:
         pytest.importorskip("DracoPy")
     mesh, cam, size = _plane_scene(32)
-    texture, _, normals = bake(mesh, [cam], size, log=lambda *a: None)
+    texture, _, normals, tangents = bake(mesh, [cam], size, log=lambda *a: None)
     textured = Mesh(mesh.vertices * 50, mesh.faces, uvs=mesh.uvs, normals=normals,
-                    texture=texture, normal_map=np.full_like(texture, 128))
+                    texture=texture, normal_map=np.full_like(texture, 128), tangents=tangents)
     path = tmp_path / "t.glb"
     textured.save(path, draco=draco)
     gltf = _glb_json(path.read_bytes())
     mat = gltf["materials"][0]
     assert "baseColorTexture" in mat["pbrMetallicRoughness"] and "normalTexture" in mat
     assert len(gltf["images"]) == 2
+    assert "TANGENT" in gltf["meshes"][0]["primitives"][0]["attributes"]
     # Metres, Y-up: the 100 mm square becomes 0.1 m wide and flat in Y.
     acc = gltf["accessors"][gltf["meshes"][0]["primitives"][0]["attributes"]["POSITION"]]
     assert acc["max"][0] - acc["min"][0] == pytest.approx(0.1)
@@ -110,8 +114,33 @@ def test_textured_glb(tmp_path, draco):
 
 def test_textured_obj_writes_material_and_images(tmp_path):
     mesh, cam, size = _plane_scene(16)
-    texture, _, _ = bake(mesh, [cam], size, log=lambda *a: None)
+    texture, _, _, _ = bake(mesh, [cam], size, log=lambda *a: None)
     Mesh(mesh.vertices, mesh.faces, uvs=mesh.uvs, texture=texture).save(tmp_path / "m.obj")
     assert (tmp_path / "m.mtl").read_text().count("map_Kd m_color.jpg") == 1
     assert (tmp_path / "m_color.jpg").exists()
     assert "f 1/1 2/2 3/3" in (tmp_path / "m.obj").read_text()
+
+
+def test_normal_map_channels_follow_gltf_convention():
+    """Regression for the convention verified in three.js against real geometry:
+    red follows +u (tangent), green follows +v (bitangent)."""
+    mesh, cam, size = _plane_scene(64)  # +u is world +x, +v is world -y
+
+    def dome(points):
+        d = points.copy()
+        d[:, 2] = 0
+        r = np.linalg.norm(d, axis=1)
+        n = np.where((r < 0.6)[:, None],
+                     np.c_[d[:, :2], np.sqrt(np.maximum(0.36 - r**2, 0.02))], [0, 0, 1.0])
+        return n / np.linalg.norm(n, axis=1, keepdims=True), np.ones(len(points), bool)
+
+    _, nm, _, _ = bake(mesh, [cam], size, field=dome, log=lambda *a: None)
+
+    def at(x, y):  # texel showing world point (x, y)
+        u, v = 0.05 + 0.9 * (x + 1) / 2, 0.95 - 0.9 * (y + 1) / 2
+        return nm[int(v * size), int(u * size)].astype(int)
+
+    assert at(0.4, 0)[0] > 170  # dome side facing +x tilts towards +u: red up
+    assert at(-0.4, 0)[0] < 85
+    assert at(0, 0.4)[1] < 85  # side facing +y tilts against +v: green down
+    assert at(0, -0.4)[1] > 170

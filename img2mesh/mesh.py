@@ -20,6 +20,7 @@ class Mesh:
     normals: np.ndarray | None = None  # optional (N, 3) shading normals
     texture: np.ndarray | None = None  # optional (H, W, 3) uint8 colour map
     normal_map: np.ndarray | None = None  # optional (H, W, 3) uint8 tangent-space normals
+    tangents: np.ndarray | None = None  # optional (N, 4) frames the normal map was baked with
 
     def __post_init__(self) -> None:
         self.vertices = np.asarray(self.vertices, dtype=np.float64).reshape(-1, 3)
@@ -30,10 +31,13 @@ class Mesh:
             self.uvs = np.asarray(self.uvs, dtype=np.float64).reshape(-1, 2)
         if self.normals is not None:
             self.normals = np.asarray(self.normals, dtype=np.float64).reshape(-1, 3)
+        if self.tangents is not None:
+            self.tangents = np.asarray(self.tangents, dtype=np.float64).reshape(-1, 4)
 
-    def _with(self, vertices: np.ndarray, normals: np.ndarray | None) -> "Mesh":
+    def _with(self, vertices: np.ndarray, normals: np.ndarray | None,
+              tangents: np.ndarray | None = None) -> "Mesh":
         return Mesh(vertices, self.faces, self.colors, self.uvs, normals,
-                    self.texture, self.normal_map)
+                    self.texture, self.normal_map, tangents)
 
     def face_normals(self) -> np.ndarray:
         v = self.vertices[self.faces]
@@ -66,11 +70,14 @@ class Mesh:
         centre = (lo + hi) / 2
         v = (self.vertices - centre) * scale
         v[:, 2] -= v[:, 2].min()
-        return self._with(v, self.normals)
+        return self._with(v, self.normals, self.tangents)
 
     def rotated(self, R: np.ndarray) -> "Mesh":
         n = None if self.normals is None else self.normals @ R.T
-        return self._with(self.vertices @ R.T, n)
+        t = None
+        if self.tangents is not None:
+            t = np.hstack([self.tangents[:, :3] @ R.T, self.tangents[:, 3:]])
+        return self._with(self.vertices @ R.T, n, t)
 
     def vertex_normals(self) -> np.ndarray:
         if self.normals is not None:
@@ -193,6 +200,9 @@ def _write_glb(mesh: Mesh, path: Path, draco: bool = False, jpeg_quality: int = 
     nrm = (mesh.vertex_normals() @ to_gltf.T).astype("<f4")
     textured = mesh.texture is not None and mesh.uvs is not None
     vcol = None if textured else mesh.vertex_colors()
+    tan = None
+    if textured and mesh.normal_map is not None and mesh.tangents is not None:
+        tan = np.hstack([mesh.tangents[:, :3] @ to_gltf.T, mesh.tangents[:, 3:]]).astype("<f4")
     idx = mesh.faces.astype("<u4")
     if draco and vcol is not None:
         raise ValueError("Draco export supports textured or plain meshes, not vertex colours")
@@ -229,12 +239,15 @@ def _write_glb(mesh: Mesh, path: Path, draco: bool = False, jpeg_quality: int = 
             pos, idx.astype(np.uint32), quantization_bits=16, compression_level=7,
             tex_coord=uv, normals=nrm.astype(np.float64), tex_coord_quantization_bits=14,
             normal_quantization_bits=10, preserve_order=True,
+            generic_attributes=None if tan is None else {0: tan.astype(np.float64)},
         )
         ids = _draco_attribute_ids(encoded)
         attrs = {"POSITION": add_accessor(None, 5126, len(pos), "VEC3", **bounds),
                  "NORMAL": add_accessor(None, 5126, len(pos), "VEC3")}
         if textured:
             attrs["TEXCOORD_0"] = add_accessor(None, 5126, len(pos), "VEC2")
+        if tan is not None:
+            attrs["TANGENT"] = add_accessor(None, 5126, len(pos), "VEC4")
         primitive["attributes"] = attrs
         primitive["indices"] = add_accessor(None, 5125, idx.size, "SCALAR")
         primitive["extensions"] = {"KHR_draco_mesh_compression": {
@@ -249,6 +262,9 @@ def _write_glb(mesh: Mesh, path: Path, draco: bool = False, jpeg_quality: int = 
         if textured:
             primitive["attributes"]["TEXCOORD_0"] = add_accessor(
                 add_view(mesh.uvs.astype("<f4").tobytes(), 34962), 5126, len(pos), "VEC2")
+        if tan is not None:
+            primitive["attributes"]["TANGENT"] = add_accessor(
+                add_view(tan.tobytes(), 34962), 5126, len(pos), "VEC4")
         if vcol is not None:  # glTF vertex colours are linear, not sRGB
             srgb = vcol / 255.0
             linear = np.where(srgb <= 0.04045, srgb / 12.92, ((srgb + 0.055) / 1.055) ** 2.4)
@@ -307,7 +323,8 @@ def _draco_attribute_ids(encoded: bytes) -> dict[str, int]:
         kind = attr["attribute_type"]
         name = {DracoPy.AttributeType.POSITION: "POSITION",
                 DracoPy.AttributeType.NORMAL: "NORMAL",
-                DracoPy.AttributeType.TEX_COORD: "TEXCOORD_0"}.get(kind)
+                DracoPy.AttributeType.TEX_COORD: "TEXCOORD_0",
+                DracoPy.AttributeType.GENERIC: "TANGENT"}.get(kind)
         if name:
             ids[name] = int(attr["unique_id"])
     return ids
