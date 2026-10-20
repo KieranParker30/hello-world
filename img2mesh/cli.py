@@ -1,4 +1,4 @@
-"""Command-line interface: `img2mesh relief|carve|scan ...`."""
+"""Command-line interface: `img2mesh relief|carve|cutout|scan ...`."""
 
 from __future__ import annotations
 
@@ -46,6 +46,19 @@ def build_parser() -> argparse.ArgumentParser:
     c.add_argument("--keep-holes", action="store_true",
                    help="keep holes in silhouettes (e.g. a mug handle)")
     c.add_argument("--save-masks", metavar="DIR", help="write detected silhouettes for checking")
+
+    k = sub.add_parser("cutout", help="one product photo -> textured 3D cut-out (AI depth)")
+    k.add_argument("images", nargs="+", help="product photos (transparent or plain background)")
+    k.add_argument("-o", "--output", default=".",
+                   help="output .glb for one photo, or a folder for several (default: here)")
+    k.add_argument("--width", type=float, default=300.0, help="model width in mm (default 300)")
+    k.add_argument("--depth", type=float, default=0.35,
+                   help="relief depth as a fraction of the width (default 0.35)")
+    k.add_argument("--back", type=float, default=0.6,
+                   help="back depth relative to the front (default 0.6)")
+    k.add_argument("--resolution", type=int, default=400, help="grid size on the long side")
+    k.add_argument("--texture-size", type=int, default=2048, help="texture size in pixels")
+    k.add_argument("--html", action="store_true", help="also write <model-viewer> pages")
 
     p = sub.add_parser("scan", help="handheld photos -> textured 3D model (photogrammetry)")
     p.add_argument("images", nargs="+", help="20-60 overlapping photos of the object")
@@ -106,8 +119,32 @@ def write_preview_html(glb_path: str) -> Path:
     return page
 
 
+def _cutout(args) -> int:
+    from .cutout import cutout_model
+
+    out = Path(args.output)
+    single = len(args.images) == 1 and out.suffix.lower() == ".glb"
+    if not single:
+        out.mkdir(parents=True, exist_ok=True)
+    for image in args.images:
+        dst = out if single else out / (Path(image).stem + ".glb")
+        try:
+            mesh = cutout_model(image, args.width, args.depth, args.back, args.resolution,
+                                args.texture_size)
+            mesh.save(dst, draco=True)
+            if args.html:
+                write_preview_html(str(dst))
+        except (ValueError, OSError) as exc:
+            print(f"error: {image}: {exc}", file=sys.stderr)
+            return 1
+        print(f"Saved {dst}: {len(mesh.faces):,} triangles, {dst.stat().st_size / 1e6:.1f} MB")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    if args.command == "cutout":
+        return _cutout(args)
     try:
         if args.command == "relief":
             mesh = image_to_relief(args.image, args.width, args.height, args.base,

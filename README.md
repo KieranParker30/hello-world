@@ -2,11 +2,12 @@
 
 Turn images into 3D models you can view, edit or 3D-print (`.stl`, `.obj`, `.ply`, `.glb`).
 
-Three ways to build a model:
+Four ways to build a model:
 
 | Mode | Input | Output |
 |------|-------|--------|
 | `scan` | **20–60 handheld photos** of an object or scene | Full photogrammetry: a website-ready textured 3D model (`.glb`) with real detail, including dents, holes and hollows. |
+| `cutout` | **one product photo** per model (e.g. a shop's catalogue shot) | A textured 3D cut-out (`.glb`) with AI-estimated depth. It looks right from the photo's angle and nearby; the hidden sides are estimated. |
 | `relief` | **one** image | A solid slab whose surface follows the picture: a bas-relief, embossed logo, terrain or lithophane. With `--depth ai`, a neural network estimates real depth from a photo. |
 | `carve` | **several** photos taken around an object | A full 360° model, built by carving away everything outside the object's outline in each photo (the "visual hull"). |
 
@@ -104,6 +105,32 @@ For even smaller downloads, you can re-compress the textures to KTX2 or WebP wit
 | `--work-dir` | temp | Keep the intermediate files (the COLMAP project can be opened in the COLMAP GUI) |
 
 It runs on a normal CPU, no graphics card needed. On a 4-core machine, 41 phone photos take about 11 minutes at `high` and produce a 9.6 MB `.glb`. The underside of an object on a table is never photographed, so it stays open.
+
+## One product photo → 3D cut-out
+
+```bash
+pip install ".[ai,photo]"
+img2mesh cutout products/*.png -o models/ --html
+```
+
+For when a single photo is all you have, such as catalogue shots on a transparent or plain background. For each photo, it:
+
+1. Keeps only the product, using the photo's transparency or its difference from the background colour.
+2. Estimates depth with [Depth Anything V2](https://huggingface.co/depth-anything/Depth-Anything-V2-Base-hf). The model downloads (~400 MB) on first use.
+3. Builds a solid whose front follows that depth, with a shallower back, and rounds the edges where they meet.
+4. Textures it with the photo and saves a Draco-compressed `.glb`, plus a `<model-viewer>` page with `--html`.
+
+**What to expect:** from the photo's own angle the model is as sharp as the photo, and it turns convincingly about 30° either way. Parts the photo doesn't show, like the back, the underside and anything hidden, are estimated, so don't let viewers spin it all the way round. With `<model-viewer>`, limit the orbit, for example `min-camera-orbit="-35deg 60deg auto" max-camera-orbit="35deg 100deg auto"`. For a true all-round model, photograph the product from every side and use `scan`.
+
+| Option | Default | Meaning |
+|--------|---------|---------|
+| `-o` | `.` | Output folder, or a `.glb` file name for a single photo |
+| `--width` | 300 | Width of the product in mm |
+| `--depth` | 0.35 | Front relief depth as a fraction of the width |
+| `--back` | 0.6 | Back depth relative to the front |
+| `--resolution` | 400 | Mesh grid points on the long side |
+| `--texture-size` | 2048 | Texture size in pixels |
+| `--html` | off | Also write a `<model-viewer>` page per model |
 
 ## One image → relief
 
