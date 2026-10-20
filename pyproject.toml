@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "img2mesh"
+version = "0.1.0"
+description = "Turn images into 3D models (STL / OBJ / PLY)"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = ["numpy>=1.22", "Pillow>=9.0"]
+
+[project.optional-dependencies]
+ai = ["torch", "transformers>=4.40"]
+test = ["pytest"]
+
+[project.scripts]
+img2mesh = "img2mesh.cli:main"
+
+[tool.setuptools]
+packages = ["img2mesh"]
