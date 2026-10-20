@@ -1,4 +1,4 @@
-"""Command-line interface: `img2mesh relief ...` and `img2mesh carve ...`."""
+"""Command-line interface: `img2mesh relief|carve|scan ...`."""
 
 from __future__ import annotations
 
@@ -11,7 +11,7 @@ from .relief import image_to_relief
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="img2mesh", description="Turn images into 3D models (STL / OBJ / PLY)."
+        prog="img2mesh", description="Turn images into 3D models (STL / OBJ / PLY / GLB)."
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
@@ -44,6 +44,20 @@ def build_parser() -> argparse.ArgumentParser:
     c.add_argument("--keep-holes", action="store_true",
                    help="keep holes in silhouettes (e.g. a mug handle)")
     c.add_argument("--save-masks", metavar="DIR", help="write detected silhouettes for checking")
+
+    p = sub.add_parser("scan", help="handheld photos -> textured 3D model (photogrammetry)")
+    p.add_argument("images", nargs="+", help="20-60 overlapping photos of the object")
+    p.add_argument("-o", "--output", default="model.glb",
+                   help="output .glb/.ply/.obj keep colour, .stl does not (default model.glb)")
+    p.add_argument("--resolution", type=int, default=200, help="voxels on longest side")
+    p.add_argument("--size", type=float, default=100.0, help="largest dimension in mm")
+    p.add_argument("--crop", type=float, default=0.75,
+                   help="how much surroundings to keep (bigger = more, default 0.75)")
+    p.add_argument("--image-size", type=int, default=1600,
+                   help="photo size used for camera solving (default 1600)")
+    p.add_argument("--dense-size", type=int, default=1000,
+                   help="photo size used for depth maps (default 1000)")
+    p.add_argument("--work-dir", help="keep intermediate files (COLMAP database, sparse model)")
     return parser
 
 
@@ -53,6 +67,11 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "relief":
             mesh = image_to_relief(args.image, args.width, args.height, args.base,
                                    args.resolution, args.depth, args.invert, args.smooth)
+        elif args.command == "scan":
+            from .photogrammetry import reconstruct
+
+            mesh = reconstruct(args.images, args.resolution, args.size, args.image_size,
+                               args.dense_size, crop=args.crop, work_dir=args.work_dir)
         else:
             angles = [float(a) for a in args.angles.split(",")] if args.angles else None
             mesh = images_to_model(args.images, angles, args.resolution, args.size,
@@ -66,4 +85,6 @@ def main(argv: list[str] | None = None) -> int:
     lo, hi = mesh.bounds()
     dims = " x ".join(f"{d:.1f}" for d in hi - lo)
     print(f"Saved {args.output}: {len(mesh.faces):,} triangles, {dims} mm")
+    if args.command == "scan" and args.output.lower().endswith(".stl"):
+        print("note: STL has no colour; use .glb, .ply or .obj to keep the photo colours")
     return 0

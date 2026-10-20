@@ -33,14 +33,20 @@ def gaussian_blur3d(grid: np.ndarray, sigma: float) -> np.ndarray:
     return out
 
 
-def surface_nets(field: np.ndarray, iso: float = 0.5, spacing=(1.0, 1.0, 1.0)) -> Mesh:
+def surface_nets(
+    field: np.ndarray, iso: float = 0.5, spacing=(1.0, 1.0, 1.0), valid: np.ndarray | None = None
+) -> Mesh:
     """Mesh the boundary of the region where `field > iso`.
 
-    The field is padded with "outside" values, so the result is always closed.
+    The field is padded with "outside" values, so without `valid` the result is
+    always closed. If a boolean `valid` mask is given (e.g. "this voxel was seen
+    by a camera"), no surface is created next to invalid samples, which gives an
+    open surface instead of inventing geometry nobody observed.
     Vertex coordinates are in grid units (multiplied by `spacing`) with the
     first sample of the unpadded field at the origin.
     """
     f = np.pad(np.asarray(field, dtype=np.float64), 1, constant_values=min(iso - 1, field.min()))
+    ok = np.ones(f.shape, dtype=bool) if valid is None else np.pad(valid, 1, constant_values=True)
     inside = f > iso
     nx, ny, nz = f.shape
     cell_shape = (nx - 1, ny - 1, nz - 1)
@@ -55,7 +61,8 @@ def surface_nets(field: np.ndarray, iso: float = 0.5, spacing=(1.0, 1.0, 1.0)) -
         step[axis] = 1
         bx, by, bz = ox + step[0], oy + step[1], oz + step[2]
         b = f[bx:bx + cx, by:by + cy, bz:bz + cz]
-        crosses = (a > iso) != (b > iso)
+        crosses = ((a > iso) != (b > iso)) & ok[ox:ox + cx, oy:oy + cy, oz:oz + cz]
+        crosses &= ok[bx:bx + cx, by:by + cy, bz:bz + cz]
         denom = np.where(crosses, b - a, 1.0)
         t = np.where(crosses, (iso - a) / denom, 0.0)
         pos = np.zeros(cell_shape + (3,))
@@ -81,7 +88,7 @@ def surface_nets(field: np.ndarray, iso: float = 0.5, spacing=(1.0, 1.0, 1.0)) -
         sl_b[axis] = slice(1, None)
         a_in = inside[tuple(sl_a)]
         b_in = inside[tuple(sl_b)]
-        edges = np.argwhere(a_in != b_in)
+        edges = np.argwhere((a_in != b_in) & ok[tuple(sl_a)] & ok[tuple(sl_b)])
         # Only edges with 4 surrounding cells (always true thanks to padding).
         edges = edges[(edges[:, u] >= 1) & (edges[:, v] >= 1)]
         outward_positive = a_in[tuple(edges.T)]  # inside -> outside along +axis

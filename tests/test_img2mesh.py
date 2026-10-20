@@ -121,3 +121,27 @@ def test_cli_end_to_end(tmp_path, capsys):
 
     assert main(["carve", paths[0], "-o", str(out)]) == 1
     assert isinstance(Mesh([[0, 0, 0]], []), Mesh)
+
+
+def test_surface_nets_valid_mask_leaves_unobserved_side_open():
+    g = np.mgrid[-10:11, -10:11, -10:11]
+    field = (np.sqrt((g**2).sum(0)) < 7).astype(float)
+    closed = surface_nets(field)
+    valid = np.ones(field.shape, dtype=bool)
+    valid[:, :, :10] = False  # bottom half never observed
+    open_mesh = surface_nets(field, valid=valid)
+    assert closed.is_watertight() and not open_mesh.is_watertight()
+    assert 0 < len(open_mesh.faces) < len(closed.faces)
+    assert open_mesh.vertices[:, 2].min() >= 9  # nothing invented below the cut
+
+
+def test_coloured_ply_and_obj(tmp_path):
+    mesh = heightmap_to_mesh(np.zeros((3, 3)))
+    mesh = Mesh(mesh.vertices, mesh.faces, np.tile([255, 0, 0], (len(mesh.vertices), 1)))
+    mesh.save(tmp_path / "c.ply")
+    data = (tmp_path / "c.ply").read_bytes()
+    assert b"property uchar red" in data
+    end = data.index(b"end_header\n") + 11
+    assert len(data) == end + 15 * len(mesh.vertices) + 13 * len(mesh.faces)
+    mesh.save(tmp_path / "c.obj")
+    assert "1.0000 0.0000 0.0000" in (tmp_path / "c.obj").read_text()

@@ -5,13 +5,14 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "img2mesh"
 version = "0.1.0"
-description = "Turn images into 3D models (STL / OBJ / PLY)"
+description = "Turn images into 3D models (STL / OBJ / PLY / GLB)"
 readme = "README.md"
 requires-python = ">=3.9"
 dependencies = ["numpy>=1.22", "Pillow>=9.0"]
 
 [project.optional-dependencies]
 ai = ["torch", "transformers>=4.40"]
+photo = ["pycolmap>=3.11", "opencv-python-headless>=4.8", "scipy>=1.10"]
 test = ["pytest"]
 
 [project.scripts]
