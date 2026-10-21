@@ -144,3 +144,25 @@ def test_normal_map_channels_follow_gltf_convention():
     assert at(-0.4, 0)[0] < 85
     assert at(0, 0.4)[1] < 85  # side facing +y tilts against +v: green down
     assert at(0, -0.4)[1] > 170
+
+
+def test_quantized_glb(tmp_path):
+    mesh, cam, size = _plane_scene(32)
+    texture, _, normals, tangents = bake(mesh, [cam], size, log=lambda *a: None)
+    textured = Mesh(mesh.vertices * 50, mesh.faces, uvs=mesh.uvs, normals=normals,
+                    texture=texture, normal_map=np.full_like(texture, 128), tangents=tangents)
+    path = tmp_path / "q.glb"
+    textured.save(path, quantize=True)
+    gltf = _glb_json(path.read_bytes())
+    assert gltf["extensionsRequired"] == ["KHR_mesh_quantization"]
+    prim = gltf["meshes"][0]["primitives"][0]
+    acc = gltf["accessors"]
+    assert acc[prim["attributes"]["POSITION"]]["componentType"] == 5122  # int16
+    assert acc[prim["indices"]]["componentType"] == 5123  # uint16 for small meshes
+    # Node transform maps int16 back to the real size: 100 mm wide -> 0.1 m.
+    node = gltf["nodes"][0]
+    pos = acc[prim["attributes"]["POSITION"]]
+    width = (pos["max"][0] - pos["min"][0]) * node["scale"][0]
+    assert width == pytest.approx(0.1, rel=1e-3)
+    with pytest.raises(ValueError):
+        textured.save(tmp_path / "x.glb", draco=True, quantize=True)

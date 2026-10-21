@@ -101,18 +101,26 @@ class Mesh:
         y = np.clip(np.round(self.uvs[:, 1] * h - 0.5), 0, h - 1).astype(int)
         return self.texture[y, x]
 
-    def save(self, path: str | Path, draco: bool = False, jpeg_quality: int = 90) -> None:
+    def save(self, path: str | Path, draco: bool = False, jpeg_quality: int = 90,
+             quantize: bool = False) -> None:
+        """Write the mesh. For .glb, `draco` compresses geometry with Draco (smallest,
+        needs a Draco decoder); `quantize` stores it with KHR_mesh_quantization
+        (compact integer attributes that every major glTF viewer reads natively)."""
         path = Path(path)
         ext = path.suffix.lower()
         if ext not in (".stl", ".obj", ".ply", ".glb"):
             raise ValueError(f"Unsupported output format '{ext}' (use .stl, .obj, .ply or .glb)")
         path.parent.mkdir(parents=True, exist_ok=True)
         if ext == ".glb":
-            _write_glb(self, path, draco, jpeg_quality)
+            _write_glb(self, path, draco, jpeg_quality, quantize)
         elif ext == ".obj":
             _write_obj(self, path, jpeg_quality)
         else:
             {".stl": _write_stl, ".ply": _write_ply}[ext](self, path)
+
+
+def _srgb_to_linear(srgb: np.ndarray) -> np.ndarray:
+    return np.where(srgb <= 0.04045, srgb / 12.92, ((srgb + 0.055) / 1.055) ** 2.4)
 
 
 def _encode_image(img: np.ndarray, quality: int) -> bytes:
@@ -189,7 +197,8 @@ def _write_ply(mesh: Mesh, path: Path) -> None:
         fh.write(faces.tobytes())
 
 
-def _write_glb(mesh: Mesh, path: Path, draco: bool = False, jpeg_quality: int = 90) -> None:
+def _write_glb(mesh: Mesh, path: Path, draco: bool = False, jpeg_quality: int = 90,
+               quantize: bool = False) -> None:
     """Binary glTF 2.0: the standard 3D format for the web (three.js, <model-viewer>,
     Babylon.js), and it opens in Blender, Windows 3D Viewer and on phones.
 
@@ -206,6 +215,9 @@ def _write_glb(mesh: Mesh, path: Path, draco: bool = False, jpeg_quality: int = 
     idx = mesh.faces.astype("<u4")
     if draco and vcol is not None:
         raise ValueError("Draco export supports textured or plain meshes, not vertex colours")
+    if draco and quantize:
+        raise ValueError("Choose either Draco compression or quantization, not both")
+    node: dict = {"mesh": 0}
 
     blob = bytearray()
     views: list[dict] = []
@@ -254,6 +266,52 @@ def _write_glb(mesh: Mesh, path: Path, draco: bool = False, jpeg_quality: int = 
             "bufferView": add_view(encoded),
             "attributes": {name: ids[name] for name in attrs}}}
         extensions_used.append("KHR_draco_mesh_compression")
+    elif quantize:
+        # KHR_mesh_quantization: 16-bit positions placed by the node's transform,
+        # 8-bit normals/tangents, 16-bit UVs. Attributes are padded to 4 bytes.
+        centre = (pos.min(0) + pos.max(0)) / 2
+        half = float(max((pos.max(0) - pos.min(0)).max() / 2, 1e-9))
+        q = np.round((pos - centre) / half * 32767).astype("<i2")
+        q4 = np.zeros((len(q), 4), "<i2")
+        q4[:, :3] = q
+        node.update(translation=[float(c) for c in centre], scale=[half / 32767] * 3)
+
+        def snorm8(a: np.ndarray, n: int) -> bytes:
+            out = np.zeros((len(a), 4), "i1")
+            out[:, :n] = np.round(np.clip(a[:, :n], -1, 1) * 127)
+            return out.tobytes()
+
+        def strided(data: bytes, stride: int) -> int:
+            view = add_view(data, 34962)
+            views[view]["byteStride"] = stride
+            return view
+
+        attrs = primitive["attributes"]
+        attrs["POSITION"] = add_accessor(strided(q4.tobytes(), 8), 5122, len(q), "VEC3",
+                                         min=q.min(0).tolist(), max=q.max(0).tolist())
+        attrs["NORMAL"] = add_accessor(strided(snorm8(nrm, 3), 4), 5120, len(q), "VEC3",
+                                       normalized=True)
+        if textured:
+            uv16 = np.round(np.clip(mesh.uvs, 0, 1) * 65535).astype("<u2")
+            attrs["TEXCOORD_0"] = add_accessor(strided(uv16.tobytes(), 4), 5123, len(q),
+                                               "VEC2", normalized=True)
+        if tan is not None:
+            t8 = np.hstack([tan[:, :3], np.sign(tan[:, 3:])])
+            attrs["TANGENT"] = add_accessor(strided(snorm8(t8, 4), 4), 5120, len(q), "VEC4",
+                                            normalized=True)
+        if vcol is not None:  # linear, 16-bit RGBA keeps dark tones and 4-byte alignment
+            linear = _srgb_to_linear(vcol / 255.0)
+            rgba = np.hstack([linear, np.ones((len(q), 1))])
+            attrs["COLOR_0"] = add_accessor(
+                add_view(np.round(rgba * 65535).astype("<u2").tobytes(), 34962),
+                5123, len(q), "VEC4", normalized=True)
+        if len(q) < 65536:
+            primitive["indices"] = add_accessor(
+                add_view(idx.astype("<u2").tobytes(), 34963), 5123, idx.size, "SCALAR")
+        else:
+            primitive["indices"] = add_accessor(
+                add_view(idx.tobytes(), 34963), 5125, idx.size, "SCALAR")
+        extensions_used.append("KHR_mesh_quantization")
     else:
         primitive["attributes"]["POSITION"] = add_accessor(
             add_view(pos.tobytes(), 34962), 5126, len(pos), "VEC3", **bounds)
@@ -266,8 +324,7 @@ def _write_glb(mesh: Mesh, path: Path, draco: bool = False, jpeg_quality: int = 
             primitive["attributes"]["TANGENT"] = add_accessor(
                 add_view(tan.tobytes(), 34962), 5126, len(pos), "VEC4")
         if vcol is not None:  # glTF vertex colours are linear, not sRGB
-            srgb = vcol / 255.0
-            linear = np.where(srgb <= 0.04045, srgb / 12.92, ((srgb + 0.055) / 1.055) ** 2.4)
+            linear = _srgb_to_linear(vcol / 255.0)
             primitive["attributes"]["COLOR_0"] = add_accessor(
                 add_view(linear.astype("<f4").tobytes(), 34962), 5126, len(pos), "VEC3")
         primitive["indices"] = add_accessor(add_view(idx.tobytes(), 34963), 5125, idx.size, "SCALAR")
@@ -292,7 +349,7 @@ def _write_glb(mesh: Mesh, path: Path, draco: bool = False, jpeg_quality: int = 
 
     gltf: dict = {
         "asset": {"version": "2.0", "generator": "img2mesh"},
-        "scene": 0, "scenes": [{"nodes": [0]}], "nodes": [{"mesh": 0}],
+        "scene": 0, "scenes": [{"nodes": [0]}], "nodes": [node],
         "meshes": [{"primitives": [primitive]}],
         "materials": [material],
         "accessors": accessors, "bufferViews": views,
